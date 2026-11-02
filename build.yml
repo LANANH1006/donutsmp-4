@@ -1,0 +1,2504 @@
+name: Build mod
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle 8.12
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.12
+
+      - name: Write project files
+        run: |
+          mkdir -p "$RUNNER_TEMP/proj" && cd "$RUNNER_TEMP/proj"
+          cat > ".gitignore" <<'EOF_DL'
+          .gradle/
+          build/
+          run/
+          .idea/
+          *.iml
+          .vscode/
+          EOF_DL
+          cat > "build.gradle" <<'EOF_DL'
+          plugins {
+              id 'fabric-loom' version '1.9-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+          base { archivesName = project.archives_base_name }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach { it.options.release = 21; it.options.encoding = 'UTF-8' }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF_DL
+          cat > "gradle.properties" <<'EOF_DL'
+          org.gradle.jvmargs=-Xmx2G
+          minecraft_version=1.21.4
+          yarn_mappings=1.21.4+build.8
+          loader_version=0.16.10
+          fabric_version=0.119.2+1.21.4
+          mod_version=1.3.0
+          maven_group=com.donutlike
+          archives_base_name=donutlike
+          EOF_DL
+          cat > "settings.gradle" <<'EOF_DL'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/Admin.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.DoubleArgumentType;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.LoreComponent;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.inventory.SimpleInventory;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.screen.GenericContainerScreenHandler;
+          import net.minecraft.screen.ScreenHandlerType;
+          import net.minecraft.screen.SimpleNamedScreenHandlerFactory;
+          import net.minecraft.screen.slot.SlotActionType;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.text.Text;
+
+          import java.util.*;
+
+          import static net.minecraft.server.command.CommandManager.argument;
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          /**
+           * Menu admin: /dladmin  -> GUI bat/tat tung tinh nang + chinh so.
+           * Cong tac tong (master) tat het = server chay gan nhu vanilla (tien cho server khac / modpack khac).
+           * Lenh: /dladmin | list | toggle <key> | set <key> <so> | master | reset
+           */
+          public class Admin {
+              /** key -> {ten hien thi, mo ta} (thu tu = thu tu hien trong menu) */
+              static final LinkedHashMap<String, String[]> FEATURES = new LinkedHashMap<>();
+              /** key -> {ten, mac dinh, buoc, min, max} */
+              static final LinkedHashMap<String, double[]> NUMS = new LinkedHashMap<>();
+              static final Map<String, String> NUM_NAMES = new HashMap<>();
+              static {
+                  f("ah", "Auction House", "/ah, /ah sell, /ah search");
+                  f("orders", "Orders", "/orders, /order");
+                  f("combat", "Combat tag", "/ct, tag khi đánh nhau, chặn tp, thoát = chết");
+                  f("spawnpvp", "Khoá PvP ở spawn", "Vùng quanh spawn không đánh nhau");
+                  f("pvpcmd", "Lệnh /pvp", "Bật/tắt PvP cá nhân");
+                  f("notes", "Tờ séc & vé rank", "/withdraw, /redeem, /rankvoucher");
+                  f("suicide", "Lệnh /suicide", "Tự sát nhanh");
+                  f("mobstack", "Gộp quái", "Creeper x100...");
+                  f("itemclean", "Dọn item rơi", "Xoá item cũ khi quá nhiều");
+                  f("amethyst", "Amethyst hết hạn", "Đồ Amethyst tự huỷ sau N giờ");
+                  f("bedlock", "Khoá nổ giường", "Giường ở Nether/End không dùng được");
+                  f("anchorlock", "Khoá Respawn Anchor", "Anchor ngoài Nether không dùng được");
+                  f("shop", "Shop & /sellall", "/shop, /sellall, /worth");
+                  f("sidebar", "Bảng bên phải", "Sidebar tiền/kills/...");
+                  f("duels", "Duel bot", "/duel");
+                  f("bases", "Căn cứ rải rác", "Tự sinh căn cứ & /randombase");
+                  n("combat_seconds", "Giây combat", 15, 5, 1, 120);
+                  n("spawn_radius", "Bán kính spawn (block)", 48, 8, 0, 512);
+                  n("max_listings", "Số món /ah tối đa", 5, 1, 1, 54);
+                  n("max_orders", "Số order tối đa", 5, 1, 1, 54);
+                  n("max_stack", "Gộp quái tối đa", 100, 10, 2, 1000);
+                  n("item_cap", "Ngưỡng dọn item", 300, 50, 50, 5000);
+                  n("amethyst_hours", "Giờ sống Amethyst", 72, 6, 1, 720);
+              }
+              static void f(String k, String name, String desc) { FEATURES.put(k, new String[]{name, desc}); }
+              static void n(String k, String name, double def, double step, double min, double max) {
+                  NUMS.put(k, new double[]{def, step, min, max}); NUM_NAMES.put(k, name);
+              }
+
+              // ===== API cho cac module khac =====
+              public static boolean on(String key) {
+                  if (DonutLike.save.masterOff) return false;
+                  Boolean b = DonutLike.save.toggles == null ? null : DonutLike.save.toggles.get(key);
+                  return b == null || b;
+              }
+              public static double num(String key) {
+                  Double v = DonutLike.save.nums == null ? null : DonutLike.save.nums.get(key);
+                  return v != null ? v : NUMS.get(key)[0];
+              }
+              public static int inum(String key) { return (int) Math.round(num(key)); }
+
+              static void setNum(String key, double v) {
+                  double[] d = NUMS.get(key);
+                  v = Math.max(d[2], Math.min(d[3], v));
+                  if (DonutLike.save.nums == null) DonutLike.save.nums = new HashMap<>();
+                  DonutLike.save.nums.put(key, v);
+                  DonutLike.doSave();
+              }
+              static boolean toggle(String key) {
+                  if (DonutLike.save.toggles == null) DonutLike.save.toggles = new HashMap<>();
+                  boolean nv = !(DonutLike.save.toggles.getOrDefault(key, true));
+                  DonutLike.save.toggles.put(key, nv);
+                  DonutLike.doSave();
+                  return nv;
+              }
+
+              // ===== lenh =====
+              static void register(CommandDispatcher<ServerCommandSource> d) {
+                  for (String root : new String[]{"dladmin", "dlmenu"}) {
+                      d.register(literal(root).requires(s -> s.hasPermissionLevel(2))
+                          .executes(c -> { open(c.getSource().getPlayerOrThrow()); return 1; })
+                          .then(literal("list").executes(c -> {
+                              StringBuilder sb = new StringBuilder("§6=== DonutLike ===  Master: " + (DonutLike.save.masterOff ? "§cTẮT" : "§aBẬT") + "\n");
+                              for (var e : FEATURES.entrySet()) sb.append(on(e.getKey()) ? "§a✔ " : "§c✘ ").append("§f").append(e.getKey()).append(" §7- ").append(e.getValue()[0]).append("\n");
+                              for (String k : NUMS.keySet()) sb.append("§e").append(k).append(" = §f").append(fmtNum(num(k))).append("\n");
+                              c.getSource().sendFeedback(() -> Text.literal(sb.toString()), false);
+                              return 1;
+                          }))
+                          .then(literal("toggle").then(argument("key", StringArgumentType.word())
+                              .suggests((c, b) -> { FEATURES.keySet().forEach(b::suggest); return b.buildFuture(); })
+                              .executes(c -> {
+                                  String k = StringArgumentType.getString(c, "key");
+                                  if (!FEATURES.containsKey(k)) { c.getSource().sendError(Text.literal("Không có tính năng: " + k)); return 0; }
+                                  boolean v = toggle(k);
+                                  c.getSource().sendFeedback(() -> Text.literal("§e" + k + ": " + (v ? "§aBẬT" : "§cTẮT")), true);
+                                  return 1;
+                              })))
+                          .then(literal("set").then(argument("key", StringArgumentType.word())
+                              .suggests((c, b) -> { NUMS.keySet().forEach(b::suggest); return b.buildFuture(); })
+                              .then(argument("value", DoubleArgumentType.doubleArg()).executes(c -> {
+                                  String k = StringArgumentType.getString(c, "key");
+                                  if (!NUMS.containsKey(k)) { c.getSource().sendError(Text.literal("Không có thiết lập: " + k)); return 0; }
+                                  setNum(k, DoubleArgumentType.getDouble(c, "value"));
+                                  c.getSource().sendFeedback(() -> Text.literal("§e" + k + " = §f" + fmtNum(num(k))), true);
+                                  return 1;
+                              }))))
+                          .then(literal("master").executes(c -> {
+                              DonutLike.save.masterOff = !DonutLike.save.masterOff;
+                              DonutLike.doSave();
+                              c.getSource().sendFeedback(() -> Text.literal("§eMod: " + (DonutLike.save.masterOff ? "§cTẮT TOÀN BỘ (vanilla)" : "§aBẬT")), true);
+                              return 1;
+                          }))
+                          .then(literal("reset").executes(c -> {
+                              DonutLike.save.toggles = new HashMap<>(); DonutLike.save.nums = new HashMap<>(); DonutLike.save.masterOff = false;
+                              DonutLike.doSave();
+                              c.getSource().sendFeedback(() -> Text.literal("§aĐã reset toàn bộ thiết lập về mặc định."), true);
+                              return 1;
+                          })));
+                  }
+              }
+
+              static String fmtNum(double v) { return v == Math.rint(v) ? String.valueOf((long) v) : String.valueOf(v); }
+
+              // ===== GUI =====
+              static void open(ServerPlayerEntity p) {
+                  p.openHandledScreen(new SimpleNamedScreenHandlerFactory(
+                      (id, inv, pl) -> new Gui(id, inv, new SimpleInventory(54)), Text.literal("DonutLike Admin")));
+              }
+
+              static ItemStack icon(net.minecraft.item.Item it, String name, String... lore) {
+                  ItemStack s = new ItemStack(it);
+                  s.set(DataComponentTypes.CUSTOM_NAME, Text.literal(name));
+                  List<Text> l = new ArrayList<>();
+                  for (String x : lore) l.add(Text.literal(x));
+                  s.set(DataComponentTypes.LORE, new LoreComponent(l));
+                  return s;
+              }
+
+              static class Gui extends GenericContainerScreenHandler {
+                  final SimpleInventory inv;
+                  final List<String> featKeys = new ArrayList<>(FEATURES.keySet());
+                  final List<String> numKeys = new ArrayList<>(NUMS.keySet());
+
+                  Gui(int id, PlayerInventory pinv, SimpleInventory inv) {
+                      super(ScreenHandlerType.GENERIC_9X6, id, pinv, inv, 6);
+                      this.inv = inv;
+                      refresh();
+                  }
+
+                  // tinh nang: slot 0..17 (2 hang). Thiet lap so: slot 27..(27+n). Master: 49. Reset: 53.
+                  void refresh() {
+                      for (int i = 0; i < 54; i++) inv.setStack(i, icon(Items.GRAY_STAINED_GLASS_PANE, " "));
+                      for (int i = 0; i < featKeys.size() && i < 27; i++) {
+                          String k = featKeys.get(i); String[] f = FEATURES.get(k);
+                          boolean on = DonutLike.save.toggles == null || DonutLike.save.toggles.getOrDefault(k, true);
+                          inv.setStack(i, icon(on ? Items.LIME_CONCRETE : Items.RED_CONCRETE,
+                              (on ? "§a✔ " : "§c✘ ") + "§f" + f[0], "§7" + f[1], "§8key: " + k, "§eClick để " + (on ? "TẮT" : "BẬT")));
+                      }
+                      for (int i = 0; i < numKeys.size() && 27 + i < 45; i++) {
+                          String k = numKeys.get(i); double[] d = NUMS.get(k);
+                          inv.setStack(27 + i, icon(Items.PAPER, "§e" + NUM_NAMES.get(k) + ": §f" + fmtNum(num(k)),
+                              "§7Mặc định: " + fmtNum(d[0]), "§aChuột trái: +" + fmtNum(d[1]) + "  §cChuột phải: -" + fmtNum(d[1]),
+                              "§7Shift: x5"));
+                      }
+                      inv.setStack(49, icon(DonutLike.save.masterOff ? Items.BARRIER : Items.BEACON,
+                          "§6Master: " + (DonutLike.save.masterOff ? "§cTẮT (vanilla)" : "§aBẬT"),
+                          "§7Tắt = mod ngừng hoạt động hoàn toàn", "§eClick để đổi"));
+                      inv.setStack(53, icon(Items.TNT, "§cReset mặc định", "§7Click để reset mọi thiết lập"));
+                  }
+
+                  @Override
+                  public void onSlotClick(int slot, int button, SlotActionType type, PlayerEntity player) {
+                      if (slot >= 0 && slot < 54 && player instanceof ServerPlayerEntity sp && sp.hasPermissionLevel(2)
+                              && (type == SlotActionType.PICKUP || type == SlotActionType.QUICK_MOVE)) {
+                          if (slot < featKeys.size() && slot < 27) toggle(featKeys.get(slot));
+                          else if (slot >= 27 && slot - 27 < numKeys.size() && slot < 45) {
+                              String k = numKeys.get(slot - 27);
+                              double step = NUMS.get(k)[1] * (type == SlotActionType.QUICK_MOVE ? 5 : 1);
+                              setNum(k, num(k) + (button == 1 ? -step : step));
+                          } else if (slot == 49) { DonutLike.save.masterOff = !DonutLike.save.masterOff; DonutLike.doSave(); }
+                          else if (slot == 53) {
+                              DonutLike.save.toggles = new HashMap<>(); DonutLike.save.nums = new HashMap<>(); DonutLike.save.masterOff = false;
+                              DonutLike.doSave();
+                          }
+                          refresh();
+                      }
+                      syncState();
+                  }
+
+                  @Override public ItemStack quickMove(PlayerEntity player, int slot) { return ItemStack.EMPTY; }
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/AntiLag.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+          import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+          import net.minecraft.block.BedBlock;
+          import net.minecraft.block.RespawnAnchorBlock;
+          import net.minecraft.command.argument.EntityArgumentType;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.LoreComponent;
+          import net.minecraft.component.type.NbtComponent;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.SpawnReason;
+          import net.minecraft.entity.ItemEntity;
+          import net.minecraft.entity.mob.HostileEntity;
+          import net.minecraft.entity.mob.MobEntity;
+          import net.minecraft.entity.boss.WitherEntity;
+          import net.minecraft.inventory.Inventory;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.ActionResult;
+          import net.minecraft.world.World;
+
+          import java.util.*;
+
+          import static net.minecraft.server.command.CommandManager.argument;
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          /**
+           * Chong lag kieu DonutSMP cu:
+           *  1) Gop quai (mob stacking): "Creeper x100", chem chet tru 1, roi loot 1 con.
+           *  2) Don item roi duoi dat khi qua nhieu.
+           *  3) Do Amethyst tu huy sau 72h (thoi gian thuc), thong bao mau tim.
+           *  4) Khoa no giuong (Nether/End) va Respawn Anchor (ngoai Nether). TNT + End Crystal van no binh thuong.
+           */
+          public class AntiLag {
+              static int maxStack() { return Admin.inum("max_stack"); }
+              static final int MERGE_INTERVAL_TICKS = 100;   // 5s
+              static int itemCap() { return Admin.inum("item_cap"); }
+              static long amethystLifetimeMs() { return (long) (Admin.num("amethyst_hours") * 3600_000L); }
+              static final String STACK_PREFIX = "dlstack:";
+
+              static final Map<String, Item> AMETHYST_BASE = new LinkedHashMap<>();
+              static {
+                  AMETHYST_BASE.put("sword", Items.NETHERITE_SWORD); AMETHYST_BASE.put("pickaxe", Items.NETHERITE_PICKAXE);
+                  AMETHYST_BASE.put("axe", Items.NETHERITE_AXE); AMETHYST_BASE.put("shovel", Items.NETHERITE_SHOVEL);
+                  AMETHYST_BASE.put("helmet", Items.NETHERITE_HELMET); AMETHYST_BASE.put("chestplate", Items.NETHERITE_CHESTPLATE);
+                  AMETHYST_BASE.put("leggings", Items.NETHERITE_LEGGINGS); AMETHYST_BASE.put("boots", Items.NETHERITE_BOOTS);
+              }
+
+              // ---------- stack helpers (luu trong command tags => ton tai qua restart) ----------
+              static int getCount(Entity e) {
+                  for (String t : e.getCommandTags()) if (t.startsWith(STACK_PREFIX)) {
+                      try { return Integer.parseInt(t.substring(STACK_PREFIX.length())); } catch (Exception ignored) {}
+                  }
+                  return 0;
+              }
+
+              static void setCount(MobEntity m, int n) {
+                  for (String t : new ArrayList<>(m.getCommandTags())) if (t.startsWith(STACK_PREFIX)) m.removeCommandTag(t);
+                  if (n > 1) {
+                      m.addCommandTag(STACK_PREFIX + n);
+                      m.setCustomName(Text.literal("§c" + m.getType().getName().getString() + " x" + n));
+                      m.setCustomNameVisible(true);
+                  } else {
+                      m.setCustomName(null);
+                      m.setCustomNameVisible(false);
+                  }
+              }
+
+              static boolean stackable(Entity e) {
+                  if (!(e instanceof HostileEntity m) || !m.isAlive()) return false;
+                  if (m instanceof WitherEntity || m.hasVehicle() || m.hasPassengers()) return false;
+                  return !m.hasCustomName() || getCount(m) > 0; // bo qua quai co ten (boss, bot duel...)
+              }
+
+              // ---------- init ----------
+              static void init() {
+                  // chem chet 1 con trong stack -> sinh lai stack con (count-1), con vua chet roi loot binh thuong
+                  ServerLivingEntityEvents.AFTER_DEATH.register((entity, src) -> {
+                      if (!Admin.on("mobstack") || !(entity instanceof MobEntity m) || !(m.getWorld() instanceof ServerWorld w)) return;
+                      int n = getCount(m);
+                      if (n <= 1) return;
+                      Entity e = m.getType().create(w, SpawnReason.EVENT);
+                      if (e instanceof MobEntity clone) {
+                          clone.refreshPositionAndAngles(m.getX(), m.getY(), m.getZ(), m.getYaw(), 0);
+                          setCount(clone, n - 1);
+                          w.spawnEntity(clone);
+                      }
+                  });
+
+                  UseBlockCallback.EVENT.register((player, world, hand, hit) -> {
+                      if (world.isClient) return ActionResult.PASS;
+                      var pos = hit.getBlockPos();
+                      var block = world.getBlockState(pos).getBlock();
+                      // khoa no giuong / anchor
+                      if (Admin.on("bedlock") && block instanceof BedBlock && !world.getRegistryKey().equals(World.OVERWORLD)) {
+                          player.sendMessage(Text.literal("§cGiường bị khoá ở thế giới này (chống nổ/lag)."), true);
+                          return ActionResult.FAIL;
+                      }
+                      if (Admin.on("anchorlock") && block instanceof RespawnAnchorBlock && !world.getRegistryKey().equals(World.NETHER)) {
+                          player.sendMessage(Text.literal("§cRespawn Anchor bị khoá ở thế giới này."), true);
+                          return ActionResult.FAIL;
+                      }
+                      // mo ruong -> quet Amethyst het han
+                      if (Admin.on("amethyst") && world.getBlockEntity(pos) instanceof Inventory inv) purge(inv, null);
+                      return ActionResult.PASS;
+                  });
+              }
+
+              // ---------- moi giay ----------
+              static void everySecond(MinecraftServer s) {
+                  long t = DonutLike.tick;
+                  if (t % MERGE_INTERVAL_TICKS == 0 && Admin.on("mobstack")) for (ServerWorld w : s.getWorlds()) mergeMobs(w);
+                  if (t % 200 == 0 && Admin.on("itemclean")) for (ServerWorld w : s.getWorlds()) cleanItems(w);
+                  if (t % 200 == 0 && Admin.on("amethyst")) for (ServerPlayerEntity p : s.getPlayerManager().getPlayerList()) {
+                      purge(p.getInventory(), p);
+                      purge(p.getEnderChestInventory(), p);
+                  }
+              }
+
+              static void mergeMobs(ServerWorld w) {
+                  Map<String, List<HostileEntity>> groups = new HashMap<>();
+                  List<Entity> all = new ArrayList<>();
+                  for (Entity e : w.iterateEntities()) all.add(e);
+                  for (Entity e : all) {
+                      if (!stackable(e)) continue;
+                      HostileEntity m = (HostileEntity) e;
+                      String key = m.getType().getTranslationKey() + ":" + ((int) m.getX() >> 3) + ":" + ((int) m.getY() >> 2) + ":" + ((int) m.getZ() >> 3);
+                      groups.computeIfAbsent(key, k -> new ArrayList<>()).add(m);
+                  }
+                  for (List<HostileEntity> g : groups.values()) {
+                      if (g.size() < 2) continue;
+                      HostileEntity keep = g.get(0);
+                      int total = Math.max(1, getCount(keep));
+                      for (int i = 1; i < g.size(); i++) {
+                          HostileEntity o = g.get(i);
+                          int c = Math.max(1, getCount(o));
+                          if (total + c > maxStack()) continue;
+                          total += c;
+                          o.discard();
+                      }
+                      if (total > 1) setCount(keep, total);
+                  }
+              }
+
+              static void cleanItems(ServerWorld w) {
+                  List<ItemEntity> items = new ArrayList<>();
+                  for (Entity e : w.iterateEntities()) if (e instanceof ItemEntity ie) items.add(ie);
+                  if (items.size() <= itemCap()) return;
+                  for (ItemEntity ie : items) if (ie.getItemAge() > 1200) ie.discard();
+              }
+
+              // ---------- Amethyst ----------
+              static boolean expired(ItemStack s) {
+                  if (s.isEmpty()) return false;
+                  NbtComponent c = s.get(DataComponentTypes.CUSTOM_DATA);
+                  if (c == null) return false;
+                  NbtCompound n = c.copyNbt();
+                  return n.contains("dl_expire") && System.currentTimeMillis() >= n.getLong("dl_expire");
+              }
+
+              static void purge(Inventory inv, ServerPlayerEntity notify) {
+                  int removed = 0;
+                  for (int i = 0; i < inv.size(); i++) {
+                      if (expired(inv.getStack(i))) { inv.setStack(i, ItemStack.EMPTY); removed++; }
+                  }
+                  if (removed > 0 && notify != null) notify.sendMessage(Text.literal("§5Sức mạnh của Amethyst đã cạn kiệt"), false);
+              }
+
+              static ItemStack makeAmethyst(String type) {
+                  Item base = AMETHYST_BASE.get(type);
+                  ItemStack s = new ItemStack(base);
+                  long exp = System.currentTimeMillis() + amethystLifetimeMs();
+                  NbtCompound n = new NbtCompound();
+                  n.putByte("dl_amethyst", (byte) 1);
+                  n.putLong("dl_expire", exp);
+                  s.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.of(n));
+                  s.set(DataComponentTypes.CUSTOM_NAME, Text.literal("§dAmethyst " + type.substring(0, 1).toUpperCase() + type.substring(1)));
+                  s.set(DataComponentTypes.LORE, new LoreComponent(List.of(
+                      Text.literal("§5Tự huỷ sau " + Admin.inum("amethyst_hours") + " giờ (thời gian thực)"),
+                      Text.literal("§7Hết hạn: " + new Date(exp)))));
+                  return s;
+              }
+
+              static void register(CommandDispatcher<ServerCommandSource> d) {
+                  // /amethyst <player> <sword|pickaxe|...> (op)
+                  d.register(literal("amethyst").requires(src -> src.hasPermissionLevel(2) && Admin.on("amethyst"))
+                      .then(argument("player", EntityArgumentType.player())
+                      .then(argument("type", StringArgumentType.word()).suggests((c, b) -> {
+                          AMETHYST_BASE.keySet().forEach(b::suggest); return b.buildFuture(); })
+                      .executes(c -> {
+                          String type = StringArgumentType.getString(c, "type");
+                          if (!AMETHYST_BASE.containsKey(type)) { c.getSource().sendError(Text.literal("Loại: " + AMETHYST_BASE.keySet())); return 0; }
+                          EntityArgumentType.getPlayer(c, "player").getInventory().offerOrDrop(makeAmethyst(type));
+                          return 1;
+                      }))));
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/Bases.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import net.minecraft.block.Block;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.block.entity.ChestBlockEntity;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.world.Heightmap;
+
+          import java.util.HashSet;
+          import java.util.Random;
+
+          /**
+           * Can cu rai rac kieu DonutSMP.
+           * - Map duoc chia thanh o luoi CELL x CELL. Moi o co xac suat BASE_CHANCE co 1 can cu (co dinh theo seed the gioi).
+           * - Khi nguoi choi den gan (TRIGGER_DIST) thi can cu moi duoc xay (1 lan duy nhat, luu o save.baseCells).
+           * - 3 kieu: WOOD (nha go nho), STONE (2 tang gach da), OBSIDIAN (ham obsidian loot xin).
+           * - Moi kieu co the NGUYEN VEN hoac BI RAID (tuong thung, ruong bi lay do, mang nhen, ho bom, vun da).
+           */
+          public class Bases {
+
+              static final int CELL = 176;
+              static final double BASE_CHANCE = 0.60;
+              static final int TRIGGER_DIST = 80;
+
+              enum Style { WOOD, STONE, OBSIDIAN }
+
+              record Result(BlockPos pos, Style style, boolean raided) {}
+
+              static final Item[] WOOD_LOOT = {Items.COAL, Items.BREAD, Items.ARROW, Items.COOKED_BEEF, Items.IRON_INGOT,
+                      Items.GOLD_INGOT, Items.TORCH, Items.ENDER_PEARL, Items.DIAMOND};
+              static final Item[] STONE_LOOT = {Items.COOKED_BEEF, Items.IRON_INGOT, Items.ARROW, Items.GOLD_INGOT, Items.EXPERIENCE_BOTTLE,
+                      Items.EMERALD, Items.OBSIDIAN, Items.ENDER_PEARL, Items.IRON_SWORD, Items.GOLDEN_APPLE, Items.DIAMOND};
+              static final Item[] OBS_LOOT = {Items.OBSIDIAN, Items.EMERALD, Items.ENDER_PEARL, Items.GOLDEN_APPLE, Items.DIAMOND,
+                      Items.DIAMOND_SWORD, Items.TOTEM_OF_UNDYING, Items.ENCHANTED_GOLDEN_APPLE, Items.NETHERITE_INGOT};
+              static final Item[] JUNK = {Items.ROTTEN_FLESH, Items.STICK, Items.ARROW, Items.COAL, Items.BONE, Items.STRING, Items.COBWEB};
+
+              // ===== Rai rac theo nguoi choi =====
+              /** Goi moi 2 giay. Xay can cu moi khi nguoi choi den gan o luoi chua xu ly. */
+              static void scatterTick(MinecraftServer s) {
+                  ServerWorld w = s.getOverworld();
+                  if (DonutLike.save.baseCells == null) DonutLike.save.baseCells = new HashSet<>();
+                  for (ServerPlayerEntity p : s.getPlayerManager().getPlayerList()) {
+                      if (p.getWorld() != w) continue;
+                      int cx0 = Math.floorDiv(p.getBlockX(), CELL), cz0 = Math.floorDiv(p.getBlockZ(), CELL);
+                      for (int cx = cx0 - 1; cx <= cx0 + 1; cx++) {
+                          for (int cz = cz0 - 1; cz <= cz0 + 1; cz++) {
+                              String key = cx + "," + cz;
+                              if (DonutLike.save.baseCells.contains(key)) continue;
+                              Random r = new Random(w.getSeed() * 31L + cx * 341873128712L + cz * 132897987541L);
+                              int bx = cx * CELL + 24 + r.nextInt(CELL - 48);
+                              int bz = cz * CELL + 24 + r.nextInt(CELL - 48);
+                              double dx = bx - p.getX(), dz = bz - p.getZ();
+                              if (dx * dx + dz * dz > (double) TRIGGER_DIST * TRIGGER_DIST) continue;
+                              DonutLike.save.baseCells.add(key); // danh dau da xu ly (co base hay khong)
+                              if (r.nextDouble() > BASE_CHANCE) continue;
+                              if (Math.abs(bx) < 64 && Math.abs(bz) < 64) continue; // khong xay sat spawn
+                              Style st = randomStyle(r);
+                              boolean raided = r.nextDouble() < (st == Style.OBSIDIAN ? 0.30 : 0.50);
+                              tryPlace(w, bx, bz, st, raided, r);
+                          }
+                      }
+                  }
+              }
+
+              static Style randomStyle(Random r) {
+                  double d = r.nextDouble();
+                  return d < 0.55 ? Style.WOOD : d < 0.85 ? Style.STONE : Style.OBSIDIAN;
+              }
+
+              // ===== Sinh 1 can cu gan 1 vi tri (dung cho /randombase va su kien dinh ky) =====
+              /** raidedOpt: null = ngau nhien, true = bi raid, false = nguyen ven. */
+              static Result spawnNear(ServerWorld w, BlockPos origin, int minD, int maxD, Boolean raidedOpt) {
+                  Random r = DonutLike.R;
+                  for (int attempt = 0; attempt < 8; attempt++) {
+                      double ang = r.nextDouble() * Math.PI * 2;
+                      int d = minD + r.nextInt(Math.max(1, maxD - minD));
+                      int x = origin.getX() + (int) (Math.cos(ang) * d);
+                      int z = origin.getZ() + (int) (Math.sin(ang) * d);
+                      Style st = randomStyle(r);
+                      boolean raided = raidedOpt != null ? raidedOpt : r.nextDouble() < (st == Style.OBSIDIAN ? 0.30 : 0.50);
+                      Result res = tryPlace(w, x, z, st, raided, r);
+                      if (res != null) return res;
+                  }
+                  return null;
+              }
+
+              static int half(Style st) { return st == Style.STONE ? 4 : 3; }
+
+              /** Tim cho bang phang, khong nuoc roi xay. Tra null neu dia hinh khong hop. */
+              static Result tryPlace(ServerWorld w, int x, int z, Style st, boolean raided, Random r) {
+                  int h = half(st);
+                  w.getChunk(x >> 4, z >> 4);
+                  int y = w.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z);
+                  int min = y, max = y;
+                  int[][] pts = {{h, h}, {h, -h}, {-h, h}, {-h, -h}};
+                  for (int[] pt : pts) {
+                      int px = x + pt[0], pz = z + pt[1];
+                      w.getChunk(px >> 4, pz >> 4);
+                      int ty = w.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, px, pz);
+                      min = Math.min(min, ty); max = Math.max(max, ty);
+                      if (!w.getFluidState(new BlockPos(px, ty - 1, pz)).isEmpty()) return null;
+                  }
+                  if (max - min > 5) return null;
+                  if (!w.getFluidState(new BlockPos(x, y - 1, z)).isEmpty()) return null;
+                  if (y <= w.getSeaLevel() - 1) return null;
+                  BlockPos c = new BlockPos(x, y, z);
+                  build(w, c, st, raided, r);
+                  return new Result(c, st, raided);
+              }
+
+              // ===== Xay can cu =====
+              static void build(ServerWorld w, BlockPos c, Style st, boolean raided, Random r) {
+                  int h = half(st);
+                  int wallH = st == Style.STONE ? 6 : 3;
+                  int roofY = wallH + 1;
+                  Block baseWall = switch (st) {
+                      case WOOD -> pick(r, Blocks.OAK_PLANKS, Blocks.SPRUCE_PLANKS, Blocks.BIRCH_PLANKS);
+                      case STONE -> Blocks.STONE_BRICKS;
+                      case OBSIDIAN -> Blocks.OBSIDIAN;
+                  };
+                  double holeP = raided ? (st == Style.OBSIDIAN ? 0.06 : 0.28) : 0;
+                  double roofHoleP = raided ? (st == Style.OBSIDIAN ? 0.04 : 0.20) : 0;
+
+                  // 1) don dep thể tich phia tren (cay, la, dat cao) + nen mong
+                  for (int dx = -h - 1; dx <= h + 1; dx++)
+                      for (int dz = -h - 1; dz <= h + 1; dz++) {
+                          for (int dy = 0; dy <= roofY + 4; dy++) DonutLike.set(w, c.add(dx, dy, dz), Blocks.AIR);
+                          if (Math.abs(dx) <= h && Math.abs(dz) <= h)
+                              for (int dy = -6; dy <= -1; dy++)
+                                  DonutLike.set(w, c.add(dx, dy, dz),
+                                          raided && r.nextDouble() < 0.3 ? Blocks.MOSSY_COBBLESTONE : Blocks.COBBLESTONE);
+                      }
+
+                  // 2) tuong + cua so + mai
+                  for (int dx = -h; dx <= h; dx++)
+                      for (int dz = -h; dz <= h; dz++) {
+                          boolean edge = Math.abs(dx) == h || Math.abs(dz) == h;
+                          boolean corner = Math.abs(dx) == h && Math.abs(dz) == h;
+                          for (int dy = 0; dy <= wallH; dy++) {
+                              if (!edge) continue;
+                              boolean door = dx == 0 && dz == -h && dy <= 1;
+                              if (door) continue;
+                              if (raided && dy >= 1 && r.nextDouble() < holeP) continue; // tuong bi dap thung
+                              boolean window = st != Style.OBSIDIAN && !corner && dy % 3 == 1 && Math.floorMod(dx + dz, 2) == 1;
+                              if (window) {
+                                  if (raided && r.nextDouble() < 0.6) continue; // kinh vo
+                                  DonutLike.set(w, c.add(dx, dy, dz), Blocks.GLASS_PANE);
+                              } else {
+                                  DonutLike.set(w, c.add(dx, dy, dz), wallBlock(st, baseWall, raided, r));
+                              }
+                          }
+                          if (!(raided && r.nextDouble() < roofHoleP))
+                              DonutLike.set(w, c.add(dx, roofY, dz), wallBlock(st, baseWall, raided, r));
+                      }
+
+                  // 3) tang 2 + thang (chi kieu STONE)
+                  if (st == Style.STONE) {
+                      for (int dx = -h + 1; dx <= h - 1; dx++)
+                          for (int dz = -h + 1; dz <= h - 1; dz++) {
+                              if (dx == h - 1 && dz == h - 1) continue; // lo thang
+                              if (raided && r.nextDouble() < 0.15) continue;
+                              DonutLike.set(w, c.add(dx, 3, dz), Blocks.OAK_PLANKS);
+                          }
+                      for (int dy = 0; dy <= 4; dy++) DonutLike.set(w, c.add(h - 1, dy, h - 1), Blocks.LADDER);
+                  }
+
+                  // 4) noi that
+                  int e = h - 1;
+                  if (!raided || r.nextBoolean()) DonutLike.set(w, c.add(-e, 0, -e), Blocks.CRAFTING_TABLE);
+                  if (!raided || r.nextBoolean()) DonutLike.set(w, c.add(e, 0, -e), Blocks.FURNACE);
+                  if (!raided || r.nextDouble() < 0.25) {
+                      DonutLike.set(w, c.add(e, 0, 0), Blocks.TORCH);
+                      DonutLike.set(w, c.add(-e, 0, 0), Blocks.TORCH);
+                      if (st == Style.STONE) {
+                          DonutLike.set(w, c.add(e, 4, 0), Blocks.TORCH);
+                          DonutLike.set(w, c.add(-e, 4, 0), Blocks.TORCH);
+                      }
+                  }
+
+                  // 5) ruong
+                  Item[] loot = st == Style.WOOD ? WOOD_LOOT : st == Style.STONE ? STONE_LOOT : OBS_LOOT;
+                  java.util.List<BlockPos> spots = new java.util.ArrayList<>();
+                  spots.add(c.add(-e, 0, e));
+                  spots.add(c.add(0, 0, e));
+                  if (st == Style.STONE) { spots.add(c.add(-e, 4, e)); spots.add(c.add(0, 4, e)); spots.add(c.add(-e, 4, -e)); }
+                  int nChest = switch (st) { case WOOD -> 1 + r.nextInt(2); case STONE -> 2 + r.nextInt(3); case OBSIDIAN -> 2 + r.nextInt(2); };
+                  java.util.Collections.shuffle(spots, r);
+                  for (int i = 0; i < Math.min(nChest, spots.size()); i++) {
+                      BlockPos cp = spots.get(i);
+                      if (raided) {
+                          double roll = r.nextDouble();
+                          if (roll < 0.40) continue;            // ruong bi lay mat luon
+                          chest(w, cp, JUNK, r.nextInt(3), r);  // chi con rac
+                          if (roll > 0.85) chestAdd(w, cp, loot, 1, r); // thinh thoang sot lai 1 mon
+                      } else {
+                          chest(w, cp, loot, 3 + r.nextInt(st == Style.OBSIDIAN ? 6 : 5), r);
+                      }
+                  }
+
+                  // 6) hieu ung raid: ho bom, mang nhen, vun
+                  if (raided) {
+                      if (st != Style.OBSIDIAN && r.nextDouble() < 0.5) {
+                          int sx = r.nextBoolean() ? h : -h, sz = r.nextBoolean() ? h : -h;
+                          for (int dx = -2; dx <= 2; dx++)
+                              for (int dy = -1; dy <= 3; dy++)
+                                  for (int dz = -2; dz <= 2; dz++) {
+                                      if (dx * dx + dy * dy + dz * dz > 5) continue;
+                                      BlockPos p = c.add(sx + dx, 1 + dy, sz + dz);
+                                      if (w.getBlockState(p).isOf(Blocks.CHEST)) continue;
+                                      DonutLike.set(w, p, Blocks.AIR);
+                                  }
+                      }
+                      for (int i = 0; i < 14; i++) {
+                          BlockPos p = c.add(r.nextInt(2 * e + 1) - e, r.nextInt(3), r.nextInt(2 * e + 1) - e);
+                          if (w.getBlockState(p).isAir()) DonutLike.set(w, p, Blocks.COBWEB);
+                      }
+                      for (int dx = -h - 2; dx <= h + 2; dx++)
+                          for (int dz = -h - 2; dz <= h + 2; dz++) {
+                              if (Math.abs(dx) <= h && Math.abs(dz) <= h) continue;
+                              double d = r.nextDouble();
+                              if (d < 0.18) DonutLike.set(w, c.add(dx, -1, dz), Blocks.COARSE_DIRT);
+                              else if (d < 0.26) DonutLike.set(w, c.add(dx, -1, dz), Blocks.NETHERRACK);
+                          }
+                  }
+              }
+
+              static Block wallBlock(Style st, Block base, boolean raided, Random r) {
+                  if (raided && st == Style.STONE) {
+                      double d = r.nextDouble();
+                      return d < 0.30 ? Blocks.CRACKED_STONE_BRICKS : d < 0.50 ? Blocks.MOSSY_STONE_BRICKS : base;
+                  }
+                  return base;
+              }
+
+              static Block pick(Random r, Block... bs) { return bs[r.nextInt(bs.length)]; }
+
+              /** Dat ruong va do n mon (mon hiem o cuoi mang, de ra it hon). */
+              static void chest(ServerWorld w, BlockPos p, Item[] loot, int n, Random r) {
+                  DonutLike.set(w, p, Blocks.CHEST);
+                  chestAdd(w, p, loot, n, r);
+              }
+
+              static void chestAdd(ServerWorld w, BlockPos p, Item[] loot, int n, Random r) {
+                  if (!(w.getBlockEntity(p) instanceof ChestBlockEntity ch)) return;
+                  for (int i = 0; i < n; i++) {
+                      Item it = loot[Math.min(r.nextInt(loot.length), r.nextInt(loot.length))];
+                      int cnt = Math.min(it.getMaxCount(), 1 + r.nextInt(5));
+                      ch.setStack(r.nextInt(27), new ItemStack(it, cnt));
+                  }
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/Combat.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.text.Text;
+          import net.minecraft.world.World;
+
+          import java.util.*;
+
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          /** Combat tag (/ct), /pvp toggle, vung spawn khong PvP. */
+          public class Combat {
+              static int tagTicks() { return 20 * Admin.inum("combat_seconds"); }
+
+              static final Map<UUID, Long> TAG = new HashMap<>();
+              static final Set<UUID> PVP_OFF = new HashSet<>();
+
+              public static boolean tagged(ServerPlayerEntity p) {
+                  if (!Admin.on("combat")) return false;
+                  Long t = TAG.get(p.getUuid());
+                  return t != null && DonutLike.tick < t;
+              }
+
+              static boolean inSpawnZone(ServerPlayerEntity p) {
+                  if (!Admin.on("spawnpvp") || !p.getWorld().getRegistryKey().equals(World.OVERWORLD)) return false;
+                  double sx, sz;
+                  if (DonutLike.save.spawn != null) { sx = DonutLike.save.spawn[0]; sz = DonutLike.save.spawn[2]; }
+                  else { var sp = p.getServer().getOverworld().getSpawnPos(); sx = sp.getX(); sz = sp.getZ(); }
+                  double dx = p.getX() - sx, dz = p.getZ() - sz;
+                  double r = Admin.num("spawn_radius");
+                  return dx * dx + dz * dz <= r * r;
+              }
+
+              static void init() {
+                  ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> {
+                      if (!(entity instanceof ServerPlayerEntity victim)) return true;
+                      if (!(source.getAttacker() instanceof ServerPlayerEntity atk) || atk == victim) return true;
+                      if (Admin.on("pvpcmd") && (PVP_OFF.contains(victim.getUuid()) || PVP_OFF.contains(atk.getUuid())) || inSpawnZone(victim) || inSpawnZone(atk)) {
+                          DonutLike.msg(atk, "§cPvP đang tắt (vùng spawn hoặc /pvp).");
+                          return false;
+                      }
+                      if (!Admin.on("combat")) return true;
+                      long until = DonutLike.tick + tagTicks();
+                      if (!tagged(victim)) DonutLike.msg(victim, "§c[Combat] Bạn đang trong chiến đấu! Thoát game = chết, không dùng được lệnh dịch chuyển.");
+                      if (!tagged(atk)) DonutLike.msg(atk, "§c[Combat] Bạn đang trong chiến đấu! Thoát game = chết, không dùng được lệnh dịch chuyển.");
+                      TAG.put(victim.getUuid(), until);
+                      TAG.put(atk.getUuid(), until);
+                      return true;
+                  });
+
+                  ServerLivingEntityEvents.AFTER_DEATH.register((entity, src) -> {
+                      if (entity instanceof ServerPlayerEntity p) TAG.remove(p.getUuid());
+                  });
+
+                  // thoat game khi dang bi tag -> chet + rot do
+                  ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+                      ServerPlayerEntity p = handler.getPlayer();
+                      if (tagged(p)) {
+                          TAG.remove(p.getUuid());
+                          server.getPlayerManager().broadcast(Text.literal("§c" + p.getName().getString() + " đã thoát game khi đang chiến đấu và bị xử tử!"), false);
+                          p.kill((ServerWorld) p.getWorld());
+                      }
+                      TAG.remove(p.getUuid());
+                  });
+              }
+
+              static void everySecond(MinecraftServer s) {
+                  if (!Admin.on("combat")) return;
+                  for (ServerPlayerEntity p : s.getPlayerManager().getPlayerList()) {
+                      Long t = TAG.get(p.getUuid());
+                      if (t == null) continue;
+                      if (DonutLike.tick >= t) {
+                          TAG.remove(p.getUuid());
+                          p.sendMessage(Text.literal("§aBạn đã thoát trạng thái chiến đấu."), true);
+                      } else {
+                          p.sendMessage(Text.literal("§cCombat: " + ((t - DonutLike.tick + 19) / 20) + "s"), true);
+                      }
+                  }
+              }
+
+              static void register(CommandDispatcher<ServerCommandSource> d) {
+                  for (String n : new String[]{"ct", "combat"}) {
+                      d.register(literal(n).requires(s -> Admin.on("combat")).executes(c -> {
+                          ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                          if (tagged(p)) DonutLike.msg(p, "§cBạn còn " + ((TAG.get(p.getUuid()) - DonutLike.tick + 19) / 20) + " giây trong combat.");
+                          else DonutLike.msg(p, "§aBạn không trong combat.");
+                          return 1;
+                      }));
+                  }
+                  d.register(literal("pvp").requires(s -> Admin.on("pvpcmd")).executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      if (tagged(p)) { DonutLike.msg(p, "§cKhông thể đổi PvP khi đang combat."); return 0; }
+                      boolean off = PVP_OFF.add(p.getUuid());
+                      if (!off) PVP_OFF.remove(p.getUuid());
+                      DonutLike.msg(p, off ? "§ePvP: §cTẮT" : "§ePvP: §aBẬT §7(vùng spawn luôn khoá PvP)");
+                      return 1;
+                  }));
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/DonutLike.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.mojang.brigadier.arguments.DoubleArgumentType;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.block.Block;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.block.entity.BlockEntity;
+          import net.minecraft.block.entity.ChestBlockEntity;
+          import net.minecraft.command.argument.EntityArgumentType;
+          import net.minecraft.command.argument.ItemStackArgumentType;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.CommandManager;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.world.Heightmap;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.*;
+
+          public class DonutLike implements ModInitializer {
+
+              // ===== Cau hinh nhanh =====
+              static final double START_MONEY = 1000;        // tien khoi dau
+              static final int BASE_INTERVAL_SECONDS = 600;  // moi 10 phut tu sinh 1 can cu
+
+              // ===== Du lieu =====
+              static class Home { double x, y, z; String dim; }
+              static class Save {
+                  Map<String, Double> bal = new HashMap<>();
+                  double[] spawn = null;
+                  Map<String, String> names = new HashMap<>();
+                  Map<String, Map<String, Home>> homes = new HashMap<>();
+                  Map<String, Integer> kills = new HashMap<>(), deaths = new HashMap<>(), shards = new HashMap<>(),
+                          duelWins = new HashMap<>(), duelLosses = new HashMap<>();
+                  Map<String, Long> playSecs = new HashMap<>(), lastDaily = new HashMap<>(), lastKit = new HashMap<>();
+                  Set<String> baseCells = new HashSet<>(); // o luoi can cu da xu ly
+                  Map<String, Boolean> toggles = new HashMap<>(); // bat/tat tinh nang (Admin)
+                  Map<String, Double> nums = new HashMap<>();      // thiet lap so (Admin)
+                  boolean masterOff = false;                        // tat toan bo mod
+                  List<Market.SavedListing> listings = new ArrayList<>(); // do dang ban tren /ah
+              }
+              static final Map<String, Double> PRICES = new LinkedHashMap<>();
+              static final String[] NAMES = {"Alex_VN", "DonutKing", "xX_Miner_Xx", "Hana", "Bao123", "NoobMaster", "Lan_Anh", "Zephyr", "TanSMP", "Minh_PvP", "CrystalGod", "Linh"};
+              static final Random R = new Random();
+              static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              static Save save = new Save();
+              static Path file;
+              static MinecraftServer SERVER;
+              static long tick = 0;
+
+              static {
+                  PRICES.put("diamond", 100.0); PRICES.put("emerald", 40.0); PRICES.put("iron_ingot", 10.0);
+                  PRICES.put("gold_ingot", 15.0); PRICES.put("netherite_ingot", 800.0); PRICES.put("coal", 3.0);
+                  PRICES.put("copper_ingot", 4.0); PRICES.put("redstone", 3.0); PRICES.put("lapis_lazuli", 4.0);
+                  PRICES.put("oak_log", 2.0); PRICES.put("cobblestone", 0.5); PRICES.put("bread", 3.0);
+                  PRICES.put("golden_apple", 60.0); PRICES.put("ender_pearl", 25.0); PRICES.put("blaze_rod", 15.0);
+                  PRICES.put("obsidian", 8.0); PRICES.put("arrow", 1.0); PRICES.put("cooked_beef", 4.0);
+                  PRICES.put("diamond_sword", 250.0); PRICES.put("iron_sword", 40.0); PRICES.put("elytra", 3000.0);
+              }
+
+              @Override
+              public void onInitialize() {
+                  file = FabricLoader.getInstance().getConfigDir().resolve("donutlike.json");
+                  load();
+                  if (save.baseCells == null) save.baseCells = new HashSet<>();
+                  Duels.init();
+                  Market.init();
+                  Combat.init();
+                  Notes.init();
+                  AntiLag.init();
+
+                  ServerLifecycleEvents.SERVER_STARTED.register(s -> SERVER = s);
+                  ServerLifecycleEvents.SERVER_STOPPING.register(s -> {
+                      Duels.endAll(s);
+                      doSave(); // /ah duoc luu xuong file, nguoi ban offline khong mat do
+                  });
+                  ServerTickEvents.END_SERVER_TICK.register(s -> {
+                      tick++;
+                      Duels.tick(s);
+                      if (tick % 20 == 0) everySecond(s);
+                  });
+
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, env) -> {
+                      // /spawn
+                      dispatcher.register(CommandManager.literal("spawn").executes(ctx -> {
+                          ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                          if (Duels.inDuel(p)) { msg(p, "§cKhông thể dùng lệnh này khi đang duel."); return 0; }
+                          if (Combat.tagged(p)) { msg(p, "§cKhông thể /spawn khi đang combat!"); return 0; }
+                          ServerWorld w = ctx.getSource().getServer().getOverworld();
+                          double x, y, z;
+                          if (save.spawn != null) { x = save.spawn[0]; y = save.spawn[1]; z = save.spawn[2]; }
+                          else {
+                              BlockPos sp = w.getSpawnPos();
+                              x = sp.getX() + 0.5; z = sp.getZ() + 0.5;
+                              y = w.getTopY(Heightmap.Type.MOTION_BLOCKING, sp.getX(), sp.getZ());
+                          }
+                          p.teleport(w, x, y, z, Set.of(), p.getYaw(), p.getPitch(), true);
+                          msg(p, "§aĐã dịch chuyển về spawn!");
+                          return 1;
+                      }));
+
+                      // /setspawn (op)
+                      dispatcher.register(CommandManager.literal("setspawn").requires(src -> src.hasPermissionLevel(2)).executes(ctx -> {
+                          ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                          save.spawn = new double[]{p.getX(), p.getY(), p.getZ()};
+                          doSave();
+                          msg(p, "§aĐã đặt spawn tại vị trí hiện tại.");
+                          return 1;
+                      }));
+
+                      // /bal
+                      dispatcher.register(CommandManager.literal("bal").executes(ctx -> {
+                          ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                          msg(p, "§eSố dư: §a$" + fmt(bal(p.getUuid())));
+                          return 1;
+                      }));
+
+                      // /pay <player> <amount>
+                      dispatcher.register(CommandManager.literal("pay")
+                          .then(CommandManager.argument("player", EntityArgumentType.player())
+                          .then(CommandManager.argument("amount", DoubleArgumentType.doubleArg(0.01)).executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              ServerPlayerEntity t = EntityArgumentType.getPlayer(ctx, "player");
+                              double a = DoubleArgumentType.getDouble(ctx, "amount");
+                              if (bal(p.getUuid()) < a) { msg(p, "§cBạn không đủ tiền."); return 0; }
+                              add(p.getUuid(), -a); add(t.getUuid(), a);
+                              msg(p, "§aĐã chuyển $" + fmt(a) + " cho " + t.getName().getString());
+                              msg(t, "§aBạn nhận được $" + fmt(a) + " từ " + p.getName().getString());
+                              return 1;
+                          }))));
+
+                      Admin.register(dispatcher);
+                      Market.register(dispatcher, registryAccess);
+                      Combat.register(dispatcher);
+                      Notes.register(dispatcher);
+                      AntiLag.register(dispatcher);
+                      ExtraCommands.register(dispatcher);
+                      Hud.register(dispatcher);
+                      Duels.register(dispatcher);
+
+                      // /randombase [intact|raided] (op) - sinh 1 can cu gan ban
+                      dispatcher.register(CommandManager.literal("randombase").requires(src -> src.hasPermissionLevel(2) && Admin.on("bases"))
+                          .executes(ctx -> runRandomBase(ctx.getSource(), null))
+                          .then(CommandManager.literal("intact").executes(ctx -> runRandomBase(ctx.getSource(), false)))
+                          .then(CommandManager.literal("raided").executes(ctx -> runRandomBase(ctx.getSource(), true))));
+                  });
+              }
+
+              static int runRandomBase(net.minecraft.server.command.ServerCommandSource src, Boolean raided) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+                  ServerPlayerEntity p = src.getPlayerOrThrow();
+                  Bases.Result r = Bases.spawnNear(src.getServer().getOverworld(), p.getBlockPos(), 40, 80, raided);
+                  if (r == null) { msg(p, "§cKhông tìm được chỗ đặt căn cứ, thử lại."); return 0; }
+                  msg(p, "§6Căn cứ " + r.style() + (r.raided() ? " (đã bị raid)" : " (còn nguyên)") + " tại "
+                          + r.pos().getX() + " " + r.pos().getY() + " " + r.pos().getZ());
+                  return 1;
+              }
+
+              // ===== Vong lap moi giay =====
+              static void everySecond(MinecraftServer s) {
+                  ExtraCommands.everySecond(s);
+                  if (Admin.on("sidebar")) Hud.everySecond(s);
+                  if (tick % 40 == 0 && Admin.on("bases")) Bases.scatterTick(s);
+                  Combat.everySecond(s);
+                  AntiLag.everySecond(s);
+
+                  // sinh can cu ngau nhien
+                  if (tick % (20L * BASE_INTERVAL_SECONDS) == 0 && Admin.on("bases")) {
+                      List<ServerPlayerEntity> ps = s.getPlayerManager().getPlayerList();
+                      if (!ps.isEmpty()) {
+                          ServerPlayerEntity p = ps.get(R.nextInt(ps.size()));
+                          if (spawnBaseNear(s.getOverworld(), p.getBlockPos(), 150, 400) != null)
+                              for (ServerPlayerEntity q : ps) msg(q, "§6Một căn cứ mới vừa xuất hiện đâu đó trong thế giới...");
+                      }
+                  }
+
+                  if (tick % (20 * 300) == 0) doSave();
+              }
+
+              // ===== Can cu ngau nhien (xem Bases.java) =====
+              static BlockPos spawnBaseNear(ServerWorld w, BlockPos origin, int minD, int maxD) {
+                  Bases.Result r = Bases.spawnNear(w, origin, minD, maxD, null);
+                  return r == null ? null : r.pos();
+              }
+
+              static void set(ServerWorld w, BlockPos p, Block b) { w.setBlockState(p, b.getDefaultState(), Block.NOTIFY_LISTENERS); }
+
+              // ===== Tien & tien ich =====
+              public static double bal(UUID id) { return save.bal.getOrDefault(id.toString(), START_MONEY); }
+              public static void add(UUID id, double a) { save.bal.put(id.toString(), bal(id) + a); }
+              public static double value(Item i) { return PRICES.getOrDefault(Registries.ITEM.getId(i).getPath(), 2.0); }
+              public static String fmt(double d) { return String.format("%.2f", d); }
+              public static void msg(ServerPlayerEntity p, String s) { p.sendMessage(Text.literal(s), false); }
+
+              static void load() {
+                  try { if (Files.exists(file)) { Save s = GSON.fromJson(Files.readString(file), Save.class); if (s != null) save = s; } }
+                  catch (Exception e) { e.printStackTrace(); }
+              }
+              static void doSave() {
+                  try { Market.snapshot(); } catch (Exception e) { e.printStackTrace(); }
+                  try { Files.writeString(file, GSON.toJson(save)); } catch (Exception e) { e.printStackTrace(); }
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/Duels.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.BoolArgumentType;
+          import com.mojang.brigadier.arguments.DoubleArgumentType;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.mojang.brigadier.context.CommandContext;
+          import com.mojang.brigadier.exceptions.CommandSyntaxException;
+          import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+          import net.minecraft.block.Block;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.command.CommandSource;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.EntityType;
+          import net.minecraft.entity.EquipmentSlot;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.entity.SpawnReason;
+          import net.minecraft.entity.attribute.EntityAttribute;
+          import net.minecraft.entity.attribute.EntityAttributeInstance;
+          import net.minecraft.entity.attribute.EntityAttributes;
+          import net.minecraft.entity.mob.MobEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.particle.ParticleTypes;
+          import net.minecraft.registry.RegistryKey;
+          import net.minecraft.registry.RegistryKeys;
+          import net.minecraft.registry.entry.RegistryEntry;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.sound.SoundCategory;
+          import net.minecraft.sound.SoundEvents;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.util.math.Box;
+          import net.minecraft.world.World;
+
+          import java.util.*;
+
+          import static net.minecraft.server.command.CommandManager.argument;
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          public class Duels {
+
+              // ===== Dau truong (tren cao, trong the gioi chinh) =====
+              static final int AX = 8000, AY = 200, AZ = 8000;
+
+              static class Spec {
+                  String name; double health, damage, speed, reward; int tier, totems; boolean crystals;
+                  Spec(String n, double h, double d, int t, double sp, int tot, boolean c, double r) {
+                      name = n; health = h; damage = d; tier = t; speed = sp; totems = tot; crystals = c; reward = r;
+                  }
+              }
+
+              static class Duel {
+                  UUID player, bot; Spec spec; double bet; int totems; boolean ending;
+                  ItemStack[] saved; String backDim; double bx, by, bz; float byaw, bpitch;
+              }
+
+              static class Task { long at; Runnable r; }
+
+              static final Map<String, Spec> SPECS = new LinkedHashMap<>();
+              static final Map<UUID, Duel> DUELS = new HashMap<>();
+              static final List<Task> TASKS = new ArrayList<>();
+
+              // tier: 0 khong, 1 da, 2 sat, 3 kim cuong, 4 netherite
+              static final Item[][] ARMOR = {
+                  {},
+                  {Items.LEATHER_HELMET, Items.LEATHER_CHESTPLATE, Items.LEATHER_LEGGINGS, Items.LEATHER_BOOTS},
+                  {Items.IRON_HELMET, Items.IRON_CHESTPLATE, Items.IRON_LEGGINGS, Items.IRON_BOOTS},
+                  {Items.DIAMOND_HELMET, Items.DIAMOND_CHESTPLATE, Items.DIAMOND_LEGGINGS, Items.DIAMOND_BOOTS},
+                  {Items.NETHERITE_HELMET, Items.NETHERITE_CHESTPLATE, Items.NETHERITE_LEGGINGS, Items.NETHERITE_BOOTS}
+              };
+              static final Item[] SWORD = {null, Items.WOODEN_SWORD, Items.IRON_SWORD, Items.DIAMOND_SWORD, Items.NETHERITE_SWORD};
+              static final double[] BONUS = {0, 3, 5, 6, 7};
+              static final EquipmentSlot[] SLOTS = {EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET};
+
+              static {
+                  //                      ten      mau  sat thuong tier toc do  totem crystal thuong
+                  SPECS.put("noob",   new Spec("Noob",   20, 3.5, 1, 0.18, 0, false, 50));
+                  SPECS.put("normal", new Spec("Normal", 20, 6.0, 2, 0.23, 0, false, 150));
+                  SPECS.put("pro",    new Spec("Pro",    20, 7.0, 4, 0.27, 1, false, 400));
+                  SPECS.put("cpvp",   new Spec("CPVP",   20, 8.0, 4, 0.28, 3, true, 1000));
+              }
+
+              public static boolean inDuel(ServerPlayerEntity p) { return DUELS.containsKey(p.getUuid()); }
+
+              static void later(long ticks, Runnable r) {
+                  Task t = new Task(); t.at = DonutLike.tick + ticks; t.r = r; TASKS.add(t);
+              }
+
+              // ===== Dang ky =====
+              static void init() {
+                  ServerLivingEntityEvents.ALLOW_DEATH.register((entity, src, amt) -> {
+                      if (entity instanceof ServerPlayerEntity p) {
+                          Duel d = DUELS.get(p.getUuid());
+                          if (d == null) return true;
+                          p.setHealth(p.getMaxHealth());
+                          p.extinguish();
+                          if (!d.ending) {
+                              d.ending = true;
+                              later(1, () -> { if (DonutLike.SERVER != null) endDuel(DonutLike.SERVER, d, false); });
+                          }
+                          return false;
+                      }
+                      for (Duel d : DUELS.values()) {
+                          if (!d.ending && d.totems > 0 && d.bot.equals(entity.getUuid())) {
+                              d.totems--;
+                              entity.setHealth(entity.getMaxHealth() * 0.5f);
+                              if (entity.getWorld() instanceof ServerWorld sw) {
+                                  sw.spawnParticles(ParticleTypes.TOTEM_OF_UNDYING, entity.getX(), entity.getY() + 1, entity.getZ(), 30, 0.3, 0.5, 0.3, 0.2);
+                                  sw.playSound(null, entity.getX(), entity.getY(), entity.getZ(), SoundEvents.ITEM_TOTEM_USE, SoundCategory.HOSTILE, 1f, 1f);
+                              }
+                              ServerPlayerEntity pl = DonutLike.SERVER == null ? null : DonutLike.SERVER.getPlayerManager().getPlayer(d.player);
+                              if (pl != null) DonutLike.msg(pl, "§e[Bot] đã pop totem! Còn " + d.totems + " totem.");
+                              return false;
+                          }
+                      }
+                      return true;
+                  });
+
+                  ServerLivingEntityEvents.AFTER_DEATH.register((entity, src) -> {
+                      if (entity instanceof ServerPlayerEntity p) {
+                          ExtraCommands.inc(DonutLike.save.deaths, p.getUuid(), 1);
+                          if (src.getAttacker() instanceof ServerPlayerEntity k && k != p)
+                              ExtraCommands.inc(DonutLike.save.kills, k.getUuid(), 1);
+                      }
+                  });
+
+                  ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+                      Duel d = DUELS.get(handler.getPlayer().getUuid());
+                      if (d != null) { d.ending = true; endDuel(server, d, false); }
+                  });
+              }
+
+              static void endAll(MinecraftServer s) {
+                  for (Duel d : new ArrayList<>(DUELS.values())) { d.ending = true; endDuel(s, d, false); }
+              }
+
+              // ===== Lenh =====
+              static void register(CommandDispatcher<ServerCommandSource> disp) {
+                  disp.register(literal("duel").requires(s -> Admin.on("duels"))
+                      .then(literal("bot")
+                          .then(argument("level", StringArgumentType.word())
+                              .suggests((c, b) -> CommandSource.suggestMatching(List.of("noob", "normal", "pro", "cpvp"), b))
+                              .executes(c -> cmdBot(c, 0))
+                              .then(argument("bet", DoubleArgumentType.doubleArg(1)).executes(c -> cmdBot(c, DoubleArgumentType.getDouble(c, "bet"))))))
+                      .then(literal("custom")
+                          .then(argument("health", IntegerArgumentType.integer(1, 200))
+                          .then(argument("damage", DoubleArgumentType.doubleArg(0.5, 30))
+                          .then(argument("speed", DoubleArgumentType.doubleArg(0.1, 0.6))
+                          .then(argument("armor", IntegerArgumentType.integer(0, 4))
+                          .then(argument("totems", IntegerArgumentType.integer(0, 10))
+                          .then(argument("crystals", BoolArgumentType.bool()).executes(c -> {
+                              ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                              Spec sp = new Spec("Custom",
+                                  IntegerArgumentType.getInteger(c, "health"),
+                                  DoubleArgumentType.getDouble(c, "damage"),
+                                  IntegerArgumentType.getInteger(c, "armor"),
+                                  DoubleArgumentType.getDouble(c, "speed"),
+                                  IntegerArgumentType.getInteger(c, "totems"),
+                                  BoolArgumentType.getBool(c, "crystals"), 0);
+                              startDuel(p, sp, 0);
+                              return 1;
+                          }))))))))
+                      .then(literal("leave").executes(c -> {
+                          ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                          Duel d = DUELS.get(p.getUuid());
+                          if (d == null) { DonutLike.msg(p, "§cBạn không ở trong duel."); return 0; }
+                          d.ending = true;
+                          endDuel(c.getSource().getServer(), d, false);
+                          return 1;
+                      })));
+              }
+
+              static int cmdBot(CommandContext<ServerCommandSource> c, double bet) throws CommandSyntaxException {
+                  ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                  Spec sp = SPECS.get(StringArgumentType.getString(c, "level").toLowerCase());
+                  if (sp == null) { DonutLike.msg(p, "§cLevel hợp lệ: noob, normal, pro, cpvp"); return 0; }
+                  startDuel(p, sp, bet);
+                  return 1;
+              }
+
+              // ===== Bat dau duel =====
+              static void startDuel(ServerPlayerEntity p, Spec sp, double bet) {
+                  if (!DUELS.isEmpty()) { DonutLike.msg(p, "§cĐấu trường đang có người duel, thử lại sau."); return; }
+                  if (DonutLike.bal(p.getUuid()) < bet) { DonutLike.msg(p, "§cKhông đủ tiền cược."); return; }
+                  MinecraftServer s = p.getServer();
+                  ServerWorld ow = s.getOverworld();
+
+                  buildArena(ow);
+
+                  MobEntity bot = EntityType.HUSK.create(ow, SpawnReason.COMMAND);
+                  if (bot == null) { DonutLike.msg(p, "§cKhông tạo được bot."); return; }
+                  bot.refreshPositionAndAngles(AX + 8.5, AY, AZ + 0.5, 90f, 0f);
+                  attr(bot, EntityAttributes.MAX_HEALTH, sp.health);
+                  bot.setHealth((float) sp.health);
+                  attr(bot, EntityAttributes.ATTACK_DAMAGE, Math.max(0.1, sp.damage - BONUS[sp.tier]));
+                  attr(bot, EntityAttributes.MOVEMENT_SPEED, sp.speed);
+                  attr(bot, EntityAttributes.FOLLOW_RANGE, 40);
+                  if (sp.tier > 0) {
+                      for (int i = 0; i < 4; i++) bot.equipStack(SLOTS[i], new ItemStack(ARMOR[sp.tier][i]));
+                      if (sp.damage >= BONUS[sp.tier]) bot.equipStack(EquipmentSlot.MAINHAND, new ItemStack(SWORD[sp.tier]));
+                  }
+                  bot.setCustomName(Text.literal("§c[Bot " + sp.name + "]"));
+                  bot.setCustomNameVisible(true);
+                  bot.setPersistent();
+                  bot.setAiDisabled(true); // dung yen trong luc dem nguoc
+                  ow.spawnEntity(bot);
+
+                  Duel d = new Duel();
+                  d.player = p.getUuid(); d.bot = bot.getUuid(); d.spec = sp; d.bet = bet; d.totems = sp.totems;
+                  d.backDim = p.getWorld().getRegistryKey().getValue().toString();
+                  d.bx = p.getX(); d.by = p.getY(); d.bz = p.getZ(); d.byaw = p.getYaw(); d.bpitch = p.getPitch();
+                  d.saved = new ItemStack[p.getInventory().size()];
+                  for (int i = 0; i < d.saved.length; i++) d.saved[i] = p.getInventory().getStack(i).copy();
+                  DUELS.put(p.getUuid(), d);
+
+                  DonutLike.add(p.getUuid(), -bet);
+                  p.getInventory().clear();
+                  giveKit(p, sp);
+                  p.setHealth(p.getMaxHealth());
+                  p.getHungerManager().setFoodLevel(20);
+                  p.clearStatusEffects();
+                  p.extinguish();
+                  p.teleport(ow, AX - 7.5, AY, AZ + 0.5, Set.of(), -90f, 0f, true);
+
+                  DonutLike.msg(p, "§6Duel với Bot " + sp.name + (bet > 0 ? " §7(cược $" + DonutLike.fmt(bet) + ")" : "") + " §6bắt đầu sau 3 giây!");
+                  for (int i = 1; i <= 3; i++) {
+                      final int n = 3 - i;
+                      later(20L * i, () -> { if (n > 0) DonutLike.msg(p, "§e" + n + "..."); });
+                  }
+                  later(60, () -> {
+                      Entity e = ow.getEntity(d.bot);
+                      if (e instanceof MobEntity m) m.setAiDisabled(false);
+                      ServerPlayerEntity pl = s.getPlayerManager().getPlayer(d.player);
+                      if (pl != null) DonutLike.msg(pl, "§c§lFIGHT!");
+                  });
+              }
+
+              static void giveKit(ServerPlayerEntity p, Spec sp) {
+                  int pt = Math.max(2, sp.tier);
+                  for (int i = 0; i < 4; i++) p.equipStack(SLOTS[i], new ItemStack(ARMOR[pt][i]));
+                  p.getInventory().setStack(0, new ItemStack(SWORD[pt]));
+                  p.getInventory().setStack(1, new ItemStack(Items.GOLDEN_APPLE, 16));
+                  p.getInventory().setStack(2, new ItemStack(Items.COOKED_BEEF, 32));
+                  if (sp.crystals) {
+                      p.getInventory().setStack(3, new ItemStack(Items.END_CRYSTAL, 16));
+                      p.getInventory().setStack(4, new ItemStack(Items.OBSIDIAN, 16));
+                  }
+                  if (pt == 4) p.equipStack(EquipmentSlot.OFFHAND, new ItemStack(Items.TOTEM_OF_UNDYING));
+              }
+
+              // ===== Ket thuc duel =====
+              static void endDuel(MinecraftServer s, Duel d, boolean win) {
+                  if (DUELS.remove(d.player) == null) return;
+                  ServerWorld ow = s.getOverworld();
+                  Entity bot = ow.getEntity(d.bot);
+                  if (bot != null) bot.discard();
+
+                  ServerPlayerEntity p = s.getPlayerManager().getPlayer(d.player);
+                  if (p != null) {
+                      p.getInventory().clear();
+                      for (int i = 0; i < d.saved.length; i++) p.getInventory().setStack(i, d.saved[i]);
+                      p.setHealth(p.getMaxHealth());
+                      p.getHungerManager().setFoodLevel(20);
+                      p.clearStatusEffects();
+                      p.extinguish();
+                      ServerWorld bw = s.getWorld(RegistryKey.of(RegistryKeys.WORLD, Identifier.of(d.backDim)));
+                      if (bw == null) bw = ow;
+                      p.teleport(bw, d.bx, d.by, d.bz, Set.of(), d.byaw, d.bpitch, true);
+                  }
+
+                  String id = d.player.toString();
+                  if (win) {
+                      double prize = d.bet * 2 + d.spec.reward;
+                      DonutLike.add(d.player, prize);
+                      ExtraCommands.inc(DonutLike.save.duelWins, d.player, 1);
+                      if (d.spec.reward > 0) ExtraCommands.inc(DonutLike.save.shards, d.player, Math.max(1, (int) (d.spec.reward / 100)));
+                      if (p != null) DonutLike.msg(p, "§a§lBẠN THẮNG! §eNhận $" + DonutLike.fmt(prize));
+                  } else {
+                      ExtraCommands.inc(DonutLike.save.duelLosses, d.player, 1);
+                      if (p != null) DonutLike.msg(p, "§c§lBẠN THUA!" + (d.bet > 0 ? " §7Mất $" + DonutLike.fmt(d.bet) : ""));
+                  }
+
+                  // don rac trong dau truong sau 2 giay
+                  later(40, () -> {
+                      Box box = new Box(AX - 14, AY - 2, AZ - 14, AX + 14, AY + 12, AZ + 14);
+                      for (Entity e : ow.getEntitiesByClass(Entity.class, box, e -> !(e instanceof PlayerEntity))) e.discard();
+                  });
+              }
+
+              // ===== Moi tick =====
+              static void tick(MinecraftServer s) {
+                  if (!TASKS.isEmpty()) {
+                      for (Task t : new ArrayList<>(TASKS)) {
+                          if (DonutLike.tick >= t.at) { TASKS.remove(t); t.r.run(); }
+                      }
+                  }
+                  if (DUELS.isEmpty()) return;
+                  ServerWorld ow = s.getOverworld();
+                  for (Duel d : new ArrayList<>(DUELS.values())) {
+                      if (d.ending) continue;
+                      ServerPlayerEntity p = s.getPlayerManager().getPlayer(d.player);
+                      if (p == null) { d.ending = true; endDuel(s, d, false); continue; }
+                      Entity e = ow.getEntity(d.bot);
+                      if (!(e instanceof MobEntity bot) || !bot.isAlive()) { d.ending = true; endDuel(s, d, true); continue; }
+                      if (DonutLike.tick % 20 == 0) bot.setTarget(p);
+                      if (d.spec.crystals && !bot.isAiDisabled() && DonutLike.tick % 50 == 0 && DonutLike.R.nextInt(100) < 70)
+                          crystalHit(ow, bot, p);
+                  }
+              }
+
+              // Mo phong crystal: no ngay canh nguoi choi (khong pha block)
+              static void crystalHit(ServerWorld w, MobEntity bot, ServerPlayerEntity p) {
+                  double dx = p.getX() - bot.getX(), dz = p.getZ() - bot.getZ();
+                  double len = Math.max(0.001, Math.sqrt(dx * dx + dz * dz));
+                  double x = p.getX() + dx / len * 2.5, z = p.getZ() + dz / len * 2.5;
+                  w.createExplosion(null, x, p.getY() + 0.2, z, 3.0f, World.ExplosionSourceType.NONE);
+              }
+
+              // ===== Dau truong =====
+              static void buildArena(ServerWorld w) {
+                  for (int dx = -12; dx <= 12; dx++) {
+                      for (int dz = -12; dz <= 12; dz++) {
+                          boolean edge = Math.abs(dx) == 12 || Math.abs(dz) == 12;
+                          DonutLike.set(w, new BlockPos(AX + dx, AY - 1, AZ + dz), (dx + dz) % 4 == 0 ? Blocks.SEA_LANTERN : Blocks.DEEPSLATE_TILES);
+                          for (int dy = 0; dy <= 6; dy++) {
+                              Block b = (edge && dy <= 5) ? Blocks.GLASS : Blocks.AIR;
+                              DonutLike.set(w, new BlockPos(AX + dx, AY + dy, AZ + dz), b);
+                          }
+                      }
+                  }
+              }
+
+              static void attr(LivingEntity e, RegistryEntry<EntityAttribute> a, double v) {
+                  EntityAttributeInstance i = e.getAttributeInstance(a);
+                  if (i != null) i.setBaseValue(v);
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/ExtraCommands.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.registry.RegistryKey;
+          import net.minecraft.registry.RegistryKeys;
+          import net.minecraft.screen.CraftingScreenHandler;
+          import net.minecraft.screen.GenericContainerScreenHandler;
+          import net.minecraft.screen.ScreenHandlerContext;
+          import net.minecraft.screen.SimpleNamedScreenHandlerFactory;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.world.Heightmap;
+
+          import java.util.*;
+
+          import static net.minecraft.server.command.CommandManager.argument;
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          public class ExtraCommands {
+
+              static class Tpa {
+                  UUID from; boolean here; long expire;
+                  Tpa(UUID f, boolean h, long e) { from = f; here = h; expire = e; }
+              }
+
+              static final Map<UUID, Tpa> TPA = new HashMap<>();
+              static final Map<UUID, Long> RTP_CD = new HashMap<>();
+              static final Set<UUID> AFK = new HashSet<>();
+
+              static void msg(ServerPlayerEntity p, String s) { DonutLike.msg(p, s); }
+
+              static boolean blocked(ServerPlayerEntity p) {
+                  if (Duels.inDuel(p)) { msg(p, "§cKhông thể dùng lệnh này khi đang duel."); return true; }
+                  if (Combat.tagged(p)) { msg(p, "§cKhông thể dịch chuyển khi đang combat!"); return true; }
+                  return false;
+              }
+
+              static void tp(ServerPlayerEntity p, ServerWorld w, double x, double y, double z) {
+                  p.teleport(w, x, y, z, Set.of(), p.getYaw(), p.getPitch(), true);
+              }
+
+              static void inc(Map<String, Integer> m, UUID id, int d) { m.merge(id.toString(), d, Integer::sum); }
+
+              static void register(CommandDispatcher<ServerCommandSource> d) {
+
+                  // /rtp
+                  d.register(literal("rtp").executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      if (blocked(p)) return 0;
+                      long now = DonutLike.tick;
+                      Long cd = RTP_CD.get(p.getUuid());
+                      if (cd != null && now < cd) { msg(p, "§cChờ " + ((cd - now) / 20) + " giây nữa."); return 0; }
+                      ServerWorld w = c.getSource().getServer().getOverworld();
+                      for (int i = 0; i < 15; i++) {
+                          int x = DonutLike.R.nextInt(10001) - 5000, z = DonutLike.R.nextInt(10001) - 5000;
+                          w.getChunk(x >> 4, z >> 4);
+                          int y = w.getTopY(Heightmap.Type.WORLD_SURFACE, x, z);
+                          if (!w.getFluidState(new BlockPos(x, y - 1, z)).isEmpty()) continue;
+                          tp(p, w, x + 0.5, y, z + 0.5);
+                          RTP_CD.put(p.getUuid(), now + 20 * 30);
+                          msg(p, "§aĐã RTP tới " + x + " " + y + " " + z);
+                          return 1;
+                      }
+                      msg(p, "§cKhông tìm được chỗ hợp lệ, thử lại.");
+                      return 0;
+                  }));
+
+                  // homes
+                  d.register(literal("sethome").executes(c -> setHome(c.getSource().getPlayerOrThrow(), "home"))
+                      .then(argument("name", StringArgumentType.word()).executes(c ->
+                          setHome(c.getSource().getPlayerOrThrow(), StringArgumentType.getString(c, "name")))));
+                  d.register(literal("home").executes(c -> goHome(c.getSource().getPlayerOrThrow(), "home"))
+                      .then(argument("name", StringArgumentType.word()).executes(c ->
+                          goHome(c.getSource().getPlayerOrThrow(), StringArgumentType.getString(c, "name")))));
+                  d.register(literal("delhome")
+                      .then(argument("name", StringArgumentType.word()).executes(c -> {
+                          ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                          Map<String, DonutLike.Home> hs = DonutLike.save.homes.get(p.getUuid().toString());
+                          String n = StringArgumentType.getString(c, "name");
+                          if (hs == null || hs.remove(n) == null) { msg(p, "§cKhông có home tên " + n); return 0; }
+                          msg(p, "§aĐã xoá home " + n);
+                          return 1;
+                      })));
+                  d.register(literal("homes").executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      Map<String, DonutLike.Home> hs = DonutLike.save.homes.get(p.getUuid().toString());
+                      msg(p, "§eHomes: §f" + (hs == null || hs.isEmpty() ? "(trống)" : String.join(", ", hs.keySet())));
+                      return 1;
+                  }));
+
+                  // tpa
+                  d.register(literal("tpa").then(argument("player", net.minecraft.command.argument.EntityArgumentType.player()).executes(c ->
+                      tpaReq(c.getSource().getPlayerOrThrow(), net.minecraft.command.argument.EntityArgumentType.getPlayer(c, "player"), false))));
+                  d.register(literal("tpahere").then(argument("player", net.minecraft.command.argument.EntityArgumentType.player()).executes(c ->
+                      tpaReq(c.getSource().getPlayerOrThrow(), net.minecraft.command.argument.EntityArgumentType.getPlayer(c, "player"), true))));
+                  d.register(literal("tpaccept").executes(c -> {
+                      ServerPlayerEntity me = c.getSource().getPlayerOrThrow();
+                      Tpa t = TPA.remove(me.getUuid());
+                      if (t == null || DonutLike.tick > t.expire) { msg(me, "§cKhông có yêu cầu tpa nào."); return 0; }
+                      ServerPlayerEntity from = c.getSource().getServer().getPlayerManager().getPlayer(t.from);
+                      if (from == null) { msg(me, "§cNgười gửi đã offline."); return 0; }
+                      ServerPlayerEntity mover = t.here ? me : from;
+                      ServerPlayerEntity dest = t.here ? from : me;
+                      if (blocked(mover)) return 0;
+                      mover.teleport((ServerWorld) dest.getWorld(), dest.getX(), dest.getY(), dest.getZ(), Set.of(), mover.getYaw(), mover.getPitch(), true);
+                      msg(me, "§aĐã chấp nhận.");
+                      msg(from, "§a" + me.getName().getString() + " đã chấp nhận.");
+                      return 1;
+                  }));
+                  d.register(literal("tpdeny").executes(c -> {
+                      ServerPlayerEntity me = c.getSource().getPlayerOrThrow();
+                      Tpa t = TPA.remove(me.getUuid());
+                      if (t == null) { msg(me, "§cKhông có yêu cầu nào."); return 0; }
+                      ServerPlayerEntity from = c.getSource().getServer().getPlayerManager().getPlayer(t.from);
+                      if (from != null) msg(from, "§c" + me.getName().getString() + " đã từ chối tpa.");
+                      msg(me, "§eĐã từ chối.");
+                      return 1;
+                  }));
+
+                  // /stats
+                  d.register(literal("stats").executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      String id = p.getUuid().toString();
+                      long secs = DonutLike.save.playSecs.getOrDefault(id, 0L);
+                      msg(p, "§6=== Thống kê ===\n§eTiền: §a$" + DonutLike.fmt(DonutLike.bal(p.getUuid()))
+                          + "\n§eShards: §d" + DonutLike.save.shards.getOrDefault(id, 0)
+                          + "\n§eKills: §f" + DonutLike.save.kills.getOrDefault(id, 0) + " §eDeaths: §f" + DonutLike.save.deaths.getOrDefault(id, 0)
+                          + "\n§eDuel thắng/thua: §f" + DonutLike.save.duelWins.getOrDefault(id, 0) + "/" + DonutLike.save.duelLosses.getOrDefault(id, 0)
+                          + "\n§eThời gian chơi: §f" + (secs / 3600) + "h " + ((secs % 3600) / 60) + "m");
+                      return 1;
+                  }));
+
+                  // /shards
+                  d.register(literal("shards").executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      msg(p, "§dShards: " + DonutLike.save.shards.getOrDefault(p.getUuid().toString(), 0) + " §7(+1 mỗi 5 phút online, thắng duel cũng được thưởng)");
+                      return 1;
+                  }));
+
+                  // /shop /trash /ec /craft
+                  d.register(literal("shop").requires(s -> Admin.on("shop")).executes(c -> { ShopHandler.open(c.getSource().getPlayerOrThrow()); return 1; }));
+                  d.register(literal("trash").executes(c -> {
+                      c.getSource().getPlayerOrThrow().openHandledScreen(new SimpleNamedScreenHandlerFactory(
+                          (id, inv, pl) -> GenericContainerScreenHandler.createGeneric9x6(id, inv), Text.literal("Thùng rác")));
+                      return 1;
+                  }));
+                  d.register(literal("ec").executes(c -> {
+                      c.getSource().getPlayerOrThrow().openHandledScreen(new SimpleNamedScreenHandlerFactory(
+                          (id, inv, pl) -> GenericContainerScreenHandler.createGeneric9x3(id, inv, pl.getEnderChestInventory()), Text.literal("Ender Chest")));
+                      return 1;
+                  }));
+                  d.register(literal("craft").executes(c -> {
+                      c.getSource().getPlayerOrThrow().openHandledScreen(new SimpleNamedScreenHandlerFactory(
+                          (id, inv, pl) -> new CraftingScreenHandler(id, inv, ScreenHandlerContext.create(pl.getWorld(), pl.getBlockPos())) {
+                              @Override public boolean canUse(PlayerEntity player) { return true; }
+                          }, Text.literal("Crafting")));
+                      return 1;
+                  }));
+
+                  // /worth /sellall
+                  d.register(literal("worth").requires(s -> Admin.on("shop")).executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      ItemStack h = p.getMainHandStack();
+                      if (h.isEmpty()) { msg(p, "§cHãy cầm vật phẩm trên tay."); return 0; }
+                      msg(p, "§eGiá bán (/sellall): §a$" + DonutLike.fmt(DonutLike.value(h.getItem()) * h.getCount() * 0.6)
+                          + " §7| §eGiá mua (/shop): §a$" + DonutLike.fmt(DonutLike.value(h.getItem()) * 1.5) + "/cái");
+                      return 1;
+                  }));
+                  d.register(literal("sellall").requires(s -> Admin.on("shop")).executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      double total = 0; int n = 0;
+                      for (int i = 0; i < 36; i++) {
+                          ItemStack s = p.getInventory().getStack(i);
+                          if (s.isEmpty()) continue;
+                          String id = net.minecraft.registry.Registries.ITEM.getId(s.getItem()).getPath();
+                          if (!DonutLike.PRICES.containsKey(id)) continue;
+                          total += DonutLike.PRICES.get(id) * s.getCount() * 0.6;
+                          n += s.getCount();
+                          p.getInventory().setStack(i, ItemStack.EMPTY);
+                      }
+                      if (n == 0) { msg(p, "§cKhông có món nào bán được cho server."); return 0; }
+                      DonutLike.add(p.getUuid(), total);
+                      msg(p, "§aĐã bán " + n + " vật phẩm, nhận $" + DonutLike.fmt(total));
+                      return 1;
+                  }));
+
+                  // /daily /kit
+                  d.register(literal("daily").executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      String id = p.getUuid().toString();
+                      long now = System.currentTimeMillis();
+                      Long last = DonutLike.save.lastDaily.get(id);
+                      if (last != null && now - last < 86400000L) {
+                          long left = (86400000L - (now - last)) / 60000;
+                          msg(p, "§cĐã nhận rồi. Quay lại sau " + (left / 60) + "h " + (left % 60) + "m");
+                          return 0;
+                      }
+                      DonutLike.save.lastDaily.put(id, now);
+                      DonutLike.add(p.getUuid(), 500);
+                      inc(DonutLike.save.shards, p.getUuid(), 5);
+                      msg(p, "§aNhận thưởng hằng ngày: $500 + 5 shards!");
+                      return 1;
+                  }));
+                  d.register(literal("kit").executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      String id = p.getUuid().toString();
+                      long now = System.currentTimeMillis();
+                      Long last = DonutLike.save.lastKit.get(id);
+                      if (last != null && now - last < 86400000L) { msg(p, "§cKit đã nhận, chờ đủ 24h."); return 0; }
+                      DonutLike.save.lastKit.put(id, now);
+                      p.getInventory().offerOrDrop(new ItemStack(Items.IRON_SWORD));
+                      p.getInventory().offerOrDrop(new ItemStack(Items.IRON_PICKAXE));
+                      p.getInventory().offerOrDrop(new ItemStack(Items.IRON_AXE));
+                      p.getInventory().offerOrDrop(new ItemStack(Items.COOKED_BEEF, 16));
+                      p.getInventory().offerOrDrop(new ItemStack(Items.TORCH, 16));
+                      msg(p, "§aĐã nhận kit khởi đầu!");
+                      return 1;
+                  }));
+
+                  // /afk
+                  d.register(literal("afk").executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      boolean now = AFK.add(p.getUuid());
+                      if (!now) AFK.remove(p.getUuid());
+                      c.getSource().getServer().getPlayerManager().broadcast(
+                          Text.literal("§7" + p.getName().getString() + (now ? " đã AFK." : " không còn AFK.")), false);
+                      return 1;
+                  }));
+
+                  // /donuthelp
+                  d.register(literal("donuthelp").executes(c -> {
+                      c.getSource().sendFeedback(() -> Text.literal(
+                          "§6=== DonutLike ===\n§e/spawn /rtp /home /sethome /delhome /homes /tpa /tpahere /tpaccept /tpdeny\n"
+                          + "§e/bal /pay /baltop /killtop /shardtop /playtop /stats /shards /daily /kit /afk /sidebar\n"
+                          + "§e/ah /ah sell <giá> /ah search <tên> /orders /orders create <item> <sl> <giá/cái> /sellall /worth /shop\n"
+                          + "§e/ct /pvp /suicide /withdraw <tiền> /redeem\n§c(op) /dladmin: menu bật/tắt tính năng | /dladmin master = tắt cả mod\n"
+                          + "§e/trash /ec /craft\n§e/duel bot <noob|normal|pro|cpvp> [cược] | /duel custom ... | /duel leave"), false);
+                      return 1;
+                  }));
+              }
+
+              static int setHome(ServerPlayerEntity p, String name) {
+                  Map<String, DonutLike.Home> hs = DonutLike.save.homes.computeIfAbsent(p.getUuid().toString(), k -> new HashMap<>());
+                  if (!hs.containsKey(name) && hs.size() >= 3) { msg(p, "§cTối đa 3 home. Dùng /delhome để xoá bớt."); return 0; }
+                  DonutLike.Home h = new DonutLike.Home();
+                  h.x = p.getX(); h.y = p.getY(); h.z = p.getZ();
+                  h.dim = p.getWorld().getRegistryKey().getValue().toString();
+                  hs.put(name, h);
+                  msg(p, "§aĐã đặt home '" + name + "'.");
+                  return 1;
+              }
+
+              static int goHome(ServerPlayerEntity p, String name) {
+                  if (blocked(p)) return 0;
+                  Map<String, DonutLike.Home> hs = DonutLike.save.homes.get(p.getUuid().toString());
+                  DonutLike.Home h = hs == null ? null : hs.get(name);
+                  if (h == null) { msg(p, "§cKhông có home '" + name + "'. Dùng /sethome."); return 0; }
+                  MinecraftServer s = p.getServer();
+                  ServerWorld w = s.getWorld(RegistryKey.of(RegistryKeys.WORLD, Identifier.of(h.dim)));
+                  if (w == null) w = s.getOverworld();
+                  tp(p, w, h.x, h.y, h.z);
+                  msg(p, "§aĐã về home '" + name + "'.");
+                  return 1;
+              }
+
+              static int tpaReq(ServerPlayerEntity p, ServerPlayerEntity t, boolean here) {
+                  if (p == t) { msg(p, "§cKhông thể tpa chính mình."); return 0; }
+                  TPA.put(t.getUuid(), new Tpa(p.getUuid(), here, DonutLike.tick + 20 * 60));
+                  msg(p, "§aĐã gửi yêu cầu tới " + t.getName().getString());
+                  msg(t, "§e" + p.getName().getString() + (here ? " muốn bạn dịch chuyển tới họ. " : " muốn dịch chuyển tới bạn. ")
+                      + "§a/tpaccept §7hoặc §c/tpdeny §7(60 giây)");
+                  return 1;
+              }
+
+              // goi moi giay: ten, thoi gian choi, shards
+              static void everySecond(MinecraftServer s) {
+                  for (ServerPlayerEntity p : s.getPlayerManager().getPlayerList()) {
+                      String id = p.getUuid().toString();
+                      DonutLike.save.names.put(id, p.getName().getString());
+                      DonutLike.save.bal.putIfAbsent(id, DonutLike.START_MONEY);
+                      long secs = DonutLike.save.playSecs.merge(id, 1L, Long::sum);
+                      if (secs % 300 == 0) {
+                          inc(DonutLike.save.shards, p.getUuid(), 1);
+                          msg(p, "§d+1 shard (online 5 phút)");
+                      }
+                  }
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/Hud.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import net.minecraft.network.packet.s2c.play.ScoreboardDisplayS2CPacket;
+          import net.minecraft.network.packet.s2c.play.ScoreboardObjectiveUpdateS2CPacket;
+          import net.minecraft.network.packet.s2c.play.ScoreboardScoreResetS2CPacket;
+          import net.minecraft.network.packet.s2c.play.ScoreboardScoreUpdateS2CPacket;
+          import net.minecraft.scoreboard.Scoreboard;
+          import net.minecraft.scoreboard.ScoreboardCriterion;
+          import net.minecraft.scoreboard.ScoreboardDisplaySlot;
+          import net.minecraft.scoreboard.ScoreboardObjective;
+          import net.minecraft.scoreboard.number.BlankNumberFormat;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.text.Text;
+
+          import java.util.*;
+          import java.util.function.Function;
+
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          /**
+           * Bang thong tin ben phai (sidebar) kieu DonutSMP cu + cac bang xep hang /baltop /killtop /shardtop /playtop.
+           * Sidebar gui bang packet rieng cho tung nguoi choi (moi nguoi thay so lieu cua minh), khong dung scoreboard cua server.
+           */
+          public class Hud {
+
+              static final String TITLE = "§6§lDONUTLIKE";
+              static final String FOOTER = "§edonutlike.local";
+              static final int MAX_LINES = 12;
+
+              static final ScoreboardObjective OBJ = new ScoreboardObjective(
+                      new Scoreboard(), "donutlike", ScoreboardCriterion.DUMMY, Text.literal(TITLE),
+                      ScoreboardCriterion.RenderType.INTEGER, true, BlankNumberFormat.INSTANCE);
+
+              /** nguoi choi dang thay sidebar -> cac dong da gui lan truoc (de chi gui lai khi doi) */
+              static final Map<UUID, List<String>> SHOWN = new HashMap<>();
+              static final Set<UUID> HIDDEN = new HashSet<>();
+
+              // ===== Sidebar =====
+              static void everySecond(MinecraftServer s) {
+                  List<ServerPlayerEntity> ps = s.getPlayerManager().getPlayerList();
+                  // don nguoi da thoat
+                  Set<UUID> online = new HashSet<>();
+                  for (ServerPlayerEntity p : ps) online.add(p.getUuid());
+                  SHOWN.keySet().retainAll(online);
+
+                  for (ServerPlayerEntity p : ps) {
+                      UUID id = p.getUuid();
+                      boolean shown = SHOWN.containsKey(id);
+                      if (HIDDEN.contains(id)) {
+                          if (shown) { hide(p); SHOWN.remove(id); }
+                          continue;
+                      }
+                      List<String> lines = buildLines(s, p);
+                      if (!shown) {
+                          p.networkHandler.sendPacket(new ScoreboardObjectiveUpdateS2CPacket(OBJ, 0));
+                          p.networkHandler.sendPacket(new ScoreboardDisplayS2CPacket(ScoreboardDisplaySlot.SIDEBAR, OBJ));
+                      }
+                      List<String> old = SHOWN.get(id);
+                      for (int i = 0; i < lines.size(); i++) {
+                          if (old != null && i < old.size() && old.get(i).equals(lines.get(i))) continue;
+                          p.networkHandler.sendPacket(new ScoreboardScoreUpdateS2CPacket(
+                                  "l" + i, OBJ.getName(), lines.size() - i,
+                                  Optional.of(Text.literal(lines.get(i))), Optional.of(BlankNumberFormat.INSTANCE)));
+                      }
+                      SHOWN.put(id, lines);
+                  }
+              }
+
+              static void hide(ServerPlayerEntity p) {
+                  for (int i = 0; i < MAX_LINES; i++)
+                      p.networkHandler.sendPacket(new ScoreboardScoreResetS2CPacket("l" + i, OBJ.getName()));
+                  p.networkHandler.sendPacket(new ScoreboardObjectiveUpdateS2CPacket(OBJ, 1));
+              }
+
+              static List<String> buildLines(MinecraftServer s, ServerPlayerEntity p) {
+                  String id = p.getUuid().toString();
+                  DonutLike.Save sv = DonutLike.save;
+                  long secs = sv.playSecs.getOrDefault(id, 0L);
+                  List<String> l = new ArrayList<>();
+                  l.add("§7" + new java.text.SimpleDateFormat("dd/MM/yy").format(new Date()));
+                  l.add(" ");
+                  l.add("§a$ §fTiền: §a$" + shortNum(DonutLike.bal(p.getUuid())));
+                  l.add("§d* §fShards: §d" + sv.shards.getOrDefault(id, 0));
+                  l.add("§c+ §fKills: §c" + sv.kills.getOrDefault(id, 0));
+                  l.add("§4x §fDeaths: §4" + sv.deaths.getOrDefault(id, 0));
+                  l.add("§e> §fPlaytime: §e" + (secs / 3600) + "h " + ((secs % 3600) / 60) + "m");
+                  l.add("§b# §fOnline: §b" + s.getCurrentPlayerCount());
+                  l.add("  ");
+                  l.add(FOOTER);
+                  return l;
+              }
+
+              /** 1500 -> 1.5K, 2300000 -> 2.3M ... giong kieu hien so tien tren DonutSMP */
+              static String shortNum(double v) {
+                  String[] suf = {"", "K", "M", "B", "T"};
+                  int i = 0;
+                  double a = v;
+                  while (Math.abs(a) >= 1000 && i < suf.length - 1) { a /= 1000; i++; }
+                  String s = i == 0 ? String.format("%.0f", a) : String.format("%.1f", a);
+                  if (s.endsWith(".0")) s = s.substring(0, s.length() - 2);
+                  return s + suf[i];
+              }
+
+              // ===== Lenh =====
+              static void register(CommandDispatcher<ServerCommandSource> d) {
+                  // /sidebar - bat/tat bang ben phai
+                  d.register(literal("sidebar").requires(s -> Admin.on("sidebar")).executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      boolean nowHidden = HIDDEN.add(p.getUuid());
+                      if (!nowHidden) HIDDEN.remove(p.getUuid());
+                      DonutLike.msg(p, nowHidden ? "§eĐã tắt bảng bên phải. Gõ /sidebar để bật lại." : "§aĐã bật bảng bên phải.");
+                      return 1;
+                  }));
+
+                  d.register(literal("baltop").executes(c ->
+                          top(c.getSource(), "Top Tiền", DonutLike.save.bal, v -> "§a$" + shortNum(v))));
+                  d.register(literal("killtop").executes(c ->
+                          top(c.getSource(), "Top Kills", DonutLike.save.kills, v -> "§c" + (long) (double) v)));
+                  d.register(literal("shardtop").executes(c ->
+                          top(c.getSource(), "Top Shards", DonutLike.save.shards, v -> "§d" + (long) (double) v)));
+                  d.register(literal("playtop").executes(c ->
+                          top(c.getSource(), "Top Thời gian chơi", DonutLike.save.playSecs,
+                                  v -> "§e" + ((long) (double) v / 3600) + "h " + (((long) (double) v % 3600) / 60) + "m")));
+              }
+
+              static int top(ServerCommandSource src, String title, Map<String, ? extends Number> map, Function<Double, String> f) {
+                  List<Map.Entry<String, ? extends Number>> l = new ArrayList<>(map.entrySet());
+                  l.sort((a, b) -> Double.compare(b.getValue().doubleValue(), a.getValue().doubleValue()));
+                  StringBuilder sb = new StringBuilder("§6§m    §r §e§l" + title + " §6§m    ");
+                  for (int i = 0; i < Math.min(10, l.size()); i++) {
+                      String key = l.get(i).getKey();
+                      String name = DonutLike.save.names.getOrDefault(key, key.length() > 8 ? key.substring(0, 8) : key);
+                      sb.append("\n§e#").append(i + 1).append(" §f").append(name)
+                        .append(" ").append(f.apply(l.get(i).getValue().doubleValue()));
+                  }
+                  ServerPlayerEntity me = src.getPlayer();
+                  if (me != null) {
+                      String mid = me.getUuid().toString();
+                      for (int i = 0; i < l.size(); i++) {
+                          if (l.get(i).getKey().equals(mid)) {
+                              sb.append("\n§7Bạn: §f#").append(i + 1).append(" ").append(f.apply(l.get(i).getValue().doubleValue()));
+                              break;
+                          }
+                      }
+                  }
+                  String out = sb.toString();
+                  src.sendFeedback(() -> Text.literal(out), false);
+                  return 1;
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/ItemIO.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.nbt.NbtElement;
+          import net.minecraft.nbt.NbtOps;
+          import net.minecraft.nbt.StringNbtReader;
+
+          /** Luu / doc ItemStack thanh chuoi SNBT de AH khong mat do khi restart. */
+          public class ItemIO {
+              public static String encode(ItemStack s) {
+                  try {
+                      var ops = DonutLike.SERVER.getRegistryManager().getOps(NbtOps.INSTANCE);
+                      return ItemStack.CODEC.encodeStart(ops, s).getOrThrow().toString();
+                  } catch (Exception e) { e.printStackTrace(); return null; }
+              }
+
+              public static ItemStack decode(String str) {
+                  try {
+                      var ops = DonutLike.SERVER.getRegistryManager().getOps(NbtOps.INSTANCE);
+                      NbtElement el = StringNbtReader.parse(str);
+                      return ItemStack.CODEC.parse(ops, el).getOrThrow();
+                  } catch (Exception e) { e.printStackTrace(); return ItemStack.EMPTY; }
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/Market.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.arguments.DoubleArgumentType;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+          import com.mojang.brigadier.CommandDispatcher;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+          import net.minecraft.command.CommandRegistryAccess;
+          import net.minecraft.command.argument.ItemStackArgumentType;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.LoreComponent;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.inventory.SimpleInventory;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.screen.GenericContainerScreenHandler;
+          import net.minecraft.screen.ScreenHandlerType;
+          import net.minecraft.screen.SimpleNamedScreenHandlerFactory;
+          import net.minecraft.screen.slot.SlotActionType;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Hand;
+
+          import java.util.*;
+
+          import static net.minecraft.server.command.CommandManager.argument;
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          /**
+           * Cho do (AH) + Order (thu mua) do NGUOI CHOI thuc su dang/giao dich.
+           * - /ah, /ah sell <gia>, /ah search <ten>   (toi da MAX_LISTINGS mon / nguoi)
+           * - /orders, /orders create <item> <sl> <gia/item>  (gia mua cao nhat len trang 1)
+           */
+          public class Market {
+              static int maxListings() { return Admin.inum("max_listings"); }
+              static int maxOrders() { return Admin.inum("max_orders"); }
+              static final int PER_PAGE = 45;
+
+              static class Listing {
+                  UUID seller; String sellerName; ItemStack stack; double price; long created;
+                  Listing(UUID s, String n, ItemStack st, double p) { seller = s; sellerName = n; stack = st; price = p; created = System.currentTimeMillis(); }
+              }
+              static class Order {
+                  UUID buyer; String buyerName; ItemStack template; int remaining; double perItem; long created;
+                  Order(UUID b, String n, ItemStack t, int r, double p) { buyer = b; buyerName = n; template = t; remaining = r; perItem = p; created = System.currentTimeMillis(); }
+              }
+              /** Dang luu xuong file (SNBT) */
+              static class SavedListing { String seller, sellerName, nbt; double price; long created; }
+
+              static final List<Listing> LISTINGS = new ArrayList<>();
+              static final List<Order> ORDERS = new ArrayList<>();
+
+              // ===== init / persistence =====
+              static void init() {
+                  ServerLifecycleEvents.SERVER_STARTED.register(Market::restore);
+                  // order cua nguoi offline duoc hoan tien (escrow) de khong mat tien
+                  ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> refundOrders(handler.getPlayer().getUuid(), false));
+              }
+
+              static void restore(net.minecraft.server.MinecraftServer s) {
+                  DonutLike.SERVER = s;
+                  LISTINGS.clear();
+                  if (DonutLike.save.listings == null) return;
+                  for (SavedListing sl : DonutLike.save.listings) {
+                      ItemStack st = ItemIO.decode(sl.nbt);
+                      if (st.isEmpty()) continue;
+                      Listing l = new Listing(UUID.fromString(sl.seller), sl.sellerName, st, sl.price);
+                      l.created = sl.created;
+                      LISTINGS.add(l);
+                  }
+              }
+
+              /** goi truoc moi lan doSave() */
+              static void snapshot() {
+                  if (DonutLike.SERVER == null) return;
+                  List<SavedListing> out = new ArrayList<>();
+                  for (Listing l : LISTINGS) {
+                      String nbt = ItemIO.encode(l.stack);
+                      if (nbt == null) continue;
+                      SavedListing sl = new SavedListing();
+                      sl.seller = l.seller.toString(); sl.sellerName = l.sellerName; sl.nbt = nbt; sl.price = l.price; sl.created = l.created;
+                      out.add(sl);
+                  }
+                  DonutLike.save.listings = out;
+              }
+
+              static void refundOrders(UUID buyer, boolean notify) {
+                  Iterator<Order> it = ORDERS.iterator();
+                  while (it.hasNext()) {
+                      Order o = it.next();
+                      if (!o.buyer.equals(buyer)) continue;
+                      DonutLike.add(buyer, o.perItem * o.remaining);
+                      it.remove();
+                  }
+              }
+
+              static long countListings(UUID u) { return LISTINGS.stream().filter(l -> l.seller.equals(u)).count(); }
+              static long countOrders(UUID u) { return ORDERS.stream().filter(o -> o.buyer.equals(u)).count(); }
+
+              // ===== lenh =====
+              static void register(CommandDispatcher<ServerCommandSource> d, CommandRegistryAccess ra) {
+                  d.register(literal("ah").requires(s -> Admin.on("ah"))
+                      .executes(c -> { openAh(c.getSource().getPlayerOrThrow(), 0, null, 0); return 1; })
+                      .then(literal("sell").then(argument("price", DoubleArgumentType.doubleArg(0.01)).executes(c -> sell(c.getSource().getPlayerOrThrow(), DoubleArgumentType.getDouble(c, "price")))))
+                      .then(literal("search").then(argument("name", StringArgumentType.greedyString()).executes(c -> {
+                          openAh(c.getSource().getPlayerOrThrow(), 0, StringArgumentType.getString(c, "name").toLowerCase(), 0); return 1; }))));
+                  // alias cu
+                  d.register(literal("sell").requires(s -> Admin.on("ah")).then(argument("price", DoubleArgumentType.doubleArg(0.01)).executes(c -> sell(c.getSource().getPlayerOrThrow(), DoubleArgumentType.getDouble(c, "price")))));
+                  d.register(ordersTree("orders", ra));
+                  d.register(ordersTree("order", ra));
+              }
+
+              static LiteralArgumentBuilder<ServerCommandSource> ordersTree(String name, CommandRegistryAccess ra) {
+                  return literal(name).requires(s -> Admin.on("orders"))
+                      .executes(c -> { openOrders(c.getSource().getPlayerOrThrow(), 0); return 1; })
+                      .then(literal("create")
+                          .then(argument("item", ItemStackArgumentType.itemStack(ra))
+                          .then(argument("amount", IntegerArgumentType.integer(1, 2304))
+                          .then(argument("price", DoubleArgumentType.doubleArg(0.01)).executes(c -> {
+                              ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                              ItemStack tpl = ItemStackArgumentType.getItemStackArgument(c, "item").createStack(1, false);
+                              return createOrder(p, tpl, IntegerArgumentType.getInteger(c, "amount"), DoubleArgumentType.getDouble(c, "price"));
+                          })))));
+              }
+
+              static int sell(ServerPlayerEntity p, double price) {
+                  ItemStack hand = p.getMainHandStack();
+                  if (hand.isEmpty()) { DonutLike.msg(p, "§cHãy cầm vật phẩm muốn bán trên tay."); return 0; }
+                  if (countListings(p.getUuid()) >= maxListings()) { DonutLike.msg(p, "§cBạn chỉ được đăng tối đa " + maxListings() + " món cùng lúc."); return 0; }
+                  LISTINGS.add(new Listing(p.getUuid(), p.getName().getString(), hand.copy(), price));
+                  p.setStackInHand(Hand.MAIN_HAND, ItemStack.EMPTY);
+                  DonutLike.msg(p, "§aĐã đăng bán lên /ah giá $" + DonutLike.fmt(price) + " §7(" + countListings(p.getUuid()) + "/" + maxListings() + ")");
+                  return 1;
+              }
+
+              static int createOrder(ServerPlayerEntity p, ItemStack tpl, int amount, double per) {
+                  if (countOrders(p.getUuid()) >= maxOrders()) { DonutLike.msg(p, "§cTối đa " + maxOrders() + " order cùng lúc."); return 0; }
+                  double total = per * amount;
+                  if (DonutLike.bal(p.getUuid()) < total) { DonutLike.msg(p, "§cBạn cần $" + DonutLike.fmt(total) + " để đặt order này."); return 0; }
+                  DonutLike.add(p.getUuid(), -total); // giu tien (escrow)
+                  ORDERS.add(new Order(p.getUuid(), p.getName().getString(), tpl, amount, per));
+                  DonutLike.msg(p, "§aĐã đặt order " + amount + "x " + tpl.getName().getString() + " ($" + DonutLike.fmt(per) + "/cái). Tiền đã được giữ lại, chờ người chơi khác giao hàng.");
+                  return 1;
+              }
+
+              // ===== GUI helpers =====
+              static ItemStack named(net.minecraft.item.Item it, String name, String... lore) {
+                  ItemStack s = new ItemStack(it);
+                  s.set(DataComponentTypes.CUSTOM_NAME, Text.literal(name));
+                  if (lore.length > 0) {
+                      List<Text> l = new ArrayList<>();
+                      for (String x : lore) l.add(Text.literal(x));
+                      s.set(DataComponentTypes.LORE, new LoreComponent(l));
+                  }
+                  return s;
+              }
+
+              static void openAh(ServerPlayerEntity p, int page, String filter, int sort) {
+                  p.openHandledScreen(new SimpleNamedScreenHandlerFactory(
+                      (id, inv, pl) -> new AhGui(id, inv, new SimpleInventory(54), pl.getUuid(), page, filter, sort),
+                      Text.literal("Auction House" + (filter != null ? " [" + filter + "]" : ""))));
+              }
+
+              static void openOrders(ServerPlayerEntity p, int page) {
+                  p.openHandledScreen(new SimpleNamedScreenHandlerFactory(
+                      (id, inv, pl) -> new OrderGui(id, inv, new SimpleInventory(54), pl.getUuid(), page),
+                      Text.literal("Orders (giá cao nhất trước)")));
+              }
+
+              static final String[] SORT_NAMES = {"Mới nhất", "Giá thấp → cao", "Giá cao → thấp"};
+
+              // ===== AH GUI =====
+              static class AhGui extends GenericContainerScreenHandler {
+                  final SimpleInventory inv; final UUID viewer; final String filter; int page, sort, pages;
+                  List<Listing> view = new ArrayList<>();
+
+                  AhGui(int id, PlayerInventory pinv, SimpleInventory inv, UUID viewer, int page, String filter, int sort) {
+                      super(ScreenHandlerType.GENERIC_9X6, id, pinv, inv, 6);
+                      this.inv = inv; this.viewer = viewer; this.page = page; this.filter = filter; this.sort = sort;
+                      refresh();
+                  }
+
+                  void refresh() {
+                      view = new ArrayList<>();
+                      for (Listing l : LISTINGS) {
+                          if (filter != null) {
+                              String n = l.stack.getName().getString().toLowerCase();
+                              String idp = Registries.ITEM.getId(l.stack.getItem()).getPath();
+                              if (!n.contains(filter) && !idp.contains(filter.replace(' ', '_'))) continue;
+                          }
+                          view.add(l);
+                      }
+                      if (sort == 0) view.sort((a, b) -> Long.compare(b.created, a.created));
+                      else if (sort == 1) view.sort(Comparator.comparingDouble(a -> a.price));
+                      else view.sort((a, b) -> Double.compare(b.price, a.price));
+                      pages = Math.max(1, (view.size() + PER_PAGE - 1) / PER_PAGE);
+                      page = Math.max(0, Math.min(page, pages - 1));
+
+                      for (int i = 0; i < 54; i++) inv.setStack(i, ItemStack.EMPTY);
+                      for (int i = 0; i < PER_PAGE; i++) {
+                          int idx = page * PER_PAGE + i;
+                          if (idx >= view.size()) break;
+                          Listing l = view.get(idx);
+                          boolean own = l.seller.equals(viewer);
+                          ItemStack d = l.stack.copy();
+                          d.set(DataComponentTypes.LORE, new LoreComponent(List.of(
+                              Text.literal("§eGiá: $" + DonutLike.fmt(l.price)),
+                              Text.literal("§7Người bán: " + l.sellerName),
+                              Text.literal(own ? "§cClick để huỷ bán" : "§aClick để mua"))));
+                          inv.setStack(i, d);
+                      }
+                      for (int i = 45; i < 54; i++) inv.setStack(i, named(Items.GRAY_STAINED_GLASS_PANE, " "));
+                      if (page > 0) inv.setStack(45, named(Items.ARROW, "§e← Trang trước"));
+                      inv.setStack(48, named(Items.HOPPER, "§bSắp xếp: " + SORT_NAMES[sort], "§7Click để đổi"));
+                      inv.setStack(49, named(Items.PAPER, "§fTrang " + (page + 1) + "/" + pages, "§7" + view.size() + " món"));
+                      if (page < pages - 1) inv.setStack(53, named(Items.ARROW, "§eTrang sau →"));
+                  }
+
+                  @Override
+                  public void onSlotClick(int slot, int button, SlotActionType type, PlayerEntity player) {
+                      if (slot >= 0 && slot < 54 && type == SlotActionType.PICKUP && player instanceof ServerPlayerEntity sp) {
+                          if (slot == 45 && page > 0) reopen(sp, page - 1, sort);
+                          else if (slot == 53 && page < pages - 1) reopen(sp, page + 1, sort);
+                          else if (slot == 48) reopen(sp, 0, (sort + 1) % 3);
+                          else if (slot < PER_PAGE) {
+                              int idx = page * PER_PAGE + slot;
+                              if (idx < view.size()) click(sp, view.get(idx));
+                              refresh();
+                          }
+                      }
+                      syncState(); // chan moi thao tac keo tha
+                  }
+
+                  void reopen(ServerPlayerEntity sp, int pg, int so) {
+                      sp.getServer().execute(() -> openAh(sp, pg, filter, so));
+                  }
+
+                  void click(ServerPlayerEntity sp, Listing l) {
+                      if (!LISTINGS.contains(l)) { DonutLike.msg(sp, "§cMón này vừa bị mua/huỷ."); return; }
+                      if (l.seller.equals(sp.getUuid())) {
+                          LISTINGS.remove(l);
+                          sp.getInventory().offerOrDrop(l.stack);
+                          DonutLike.msg(sp, "§eĐã huỷ bán, vật phẩm đã trả lại.");
+                      } else if (DonutLike.bal(sp.getUuid()) < l.price) {
+                          DonutLike.msg(sp, "§cBạn không đủ tiền ($" + DonutLike.fmt(l.price) + ").");
+                      } else {
+                          LISTINGS.remove(l);
+                          DonutLike.add(sp.getUuid(), -l.price);
+                          DonutLike.add(l.seller, l.price);
+                          ServerPlayerEntity seller = sp.getServer().getPlayerManager().getPlayer(l.seller);
+                          if (seller != null) DonutLike.msg(seller, "§a[AH] " + sp.getName().getString() + " đã mua "
+                              + l.stack.getName().getString() + " với giá $" + DonutLike.fmt(l.price));
+                          sp.getInventory().offerOrDrop(l.stack);
+                          DonutLike.msg(sp, "§aĐã mua " + l.stack.getName().getString() + " với giá $" + DonutLike.fmt(l.price));
+                      }
+                  }
+
+                  @Override public ItemStack quickMove(PlayerEntity player, int slot) { return ItemStack.EMPTY; }
+              }
+
+              // ===== ORDER GUI =====
+              static class OrderGui extends GenericContainerScreenHandler {
+                  final SimpleInventory inv; final UUID viewer; int page, pages;
+                  List<Order> view = new ArrayList<>();
+
+                  OrderGui(int id, PlayerInventory pinv, SimpleInventory inv, UUID viewer, int page) {
+                      super(ScreenHandlerType.GENERIC_9X6, id, pinv, inv, 6);
+                      this.inv = inv; this.viewer = viewer; this.page = page;
+                      refresh();
+                  }
+
+                  void refresh() {
+                      view = new ArrayList<>(ORDERS);
+                      view.sort((a, b) -> { int c = Double.compare(b.perItem, a.perItem); return c != 0 ? c : Long.compare(a.created, b.created); });
+                      pages = Math.max(1, (view.size() + PER_PAGE - 1) / PER_PAGE);
+                      page = Math.max(0, Math.min(page, pages - 1));
+                      for (int i = 0; i < 54; i++) inv.setStack(i, ItemStack.EMPTY);
+                      for (int i = 0; i < PER_PAGE; i++) {
+                          int idx = page * PER_PAGE + i;
+                          if (idx >= view.size()) break;
+                          Order o = view.get(idx);
+                          boolean own = o.buyer.equals(viewer);
+                          ItemStack d = o.template.copyWithCount(Math.max(1, Math.min(o.remaining, o.template.getMaxCount())));
+                          d.set(DataComponentTypes.LORE, new LoreComponent(List.of(
+                              Text.literal("§eGiá mua: §a$" + DonutLike.fmt(o.perItem) + "§e /cái"),
+                              Text.literal("§7Còn cần: §f" + o.remaining),
+                              Text.literal("§7Người đặt: " + o.buyerName),
+                              Text.literal(own ? "§cClick để huỷ order (hoàn tiền)" : "§aClick để giao hàng (lấy từ túi bạn)"))));
+                          inv.setStack(i, d);
+                      }
+                      for (int i = 45; i < 54; i++) inv.setStack(i, named(Items.GRAY_STAINED_GLASS_PANE, " "));
+                      if (page > 0) inv.setStack(45, named(Items.ARROW, "§e← Trang trước"));
+                      inv.setStack(49, named(Items.PAPER, "§fTrang " + (page + 1) + "/" + pages, "§7" + view.size() + " order", "§7Tạo: /orders create <item> <sl> <giá/cái>"));
+                      if (page < pages - 1) inv.setStack(53, named(Items.ARROW, "§eTrang sau →"));
+                  }
+
+                  @Override
+                  public void onSlotClick(int slot, int button, SlotActionType type, PlayerEntity player) {
+                      if (slot >= 0 && slot < 54 && type == SlotActionType.PICKUP && player instanceof ServerPlayerEntity sp) {
+                          if (slot == 45 && page > 0) { int pg = page - 1; sp.getServer().execute(() -> openOrders(sp, pg)); }
+                          else if (slot == 53 && page < pages - 1) { int pg = page + 1; sp.getServer().execute(() -> openOrders(sp, pg)); }
+                          else if (slot < PER_PAGE) {
+                              int idx = page * PER_PAGE + slot;
+                              if (idx < view.size()) click(sp, view.get(idx));
+                              refresh();
+                          }
+                      }
+                      syncState();
+                  }
+
+                  void click(ServerPlayerEntity sp, Order o) {
+                      if (!ORDERS.contains(o)) { DonutLike.msg(sp, "§cOrder này không còn."); return; }
+                      if (o.buyer.equals(sp.getUuid())) {
+                          ORDERS.remove(o);
+                          DonutLike.add(sp.getUuid(), o.perItem * o.remaining);
+                          DonutLike.msg(sp, "§eĐã huỷ order, hoàn $" + DonutLike.fmt(o.perItem * o.remaining));
+                          return;
+                      }
+                      ServerPlayerEntity buyer = sp.getServer().getPlayerManager().getPlayer(o.buyer);
+                      if (buyer == null) { refundOrders(o.buyer, false); DonutLike.msg(sp, "§cNgười đặt đã offline, order bị huỷ."); return; }
+                      int need = o.remaining, given = 0;
+                      PlayerInventory pi = sp.getInventory();
+                      for (int i = 0; i < 36 && given < need; i++) {
+                          ItemStack s = pi.getStack(i);
+                          if (s.isEmpty() || !ItemStack.areItemsAndComponentsEqual(s, o.template)) continue;
+                          int n = Math.min(s.getCount(), need - given);
+                          s.decrement(n);
+                          given += n;
+                      }
+                      if (given == 0) { DonutLike.msg(sp, "§cBạn không có vật phẩm phù hợp trong túi."); return; }
+                      double pay = o.perItem * given;
+                      DonutLike.add(sp.getUuid(), pay);
+                      o.remaining -= given;
+                      if (o.remaining <= 0) ORDERS.remove(o);
+                      int left = given;
+                      while (left > 0) {
+                          int n = Math.min(o.template.getMaxCount(), left);
+                          buyer.getInventory().offerOrDrop(o.template.copyWithCount(n));
+                          left -= n;
+                      }
+                      DonutLike.msg(sp, "§a[Order] Đã giao " + given + "x " + o.template.getName().getString() + ", nhận $" + DonutLike.fmt(pay));
+                      DonutLike.msg(buyer, "§a[Order] " + sp.getName().getString() + " đã giao " + given + "x " + o.template.getName().getString()
+                          + (o.remaining > 0 ? " (còn " + o.remaining + ")" : " — order hoàn tất"));
+                  }
+
+                  @Override public ItemStack quickMove(PlayerEntity player, int slot) { return ItemStack.EMPTY; }
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/Notes.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.DoubleArgumentType;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.fabricmc.fabric.api.event.player.UseItemCallback;
+          import net.minecraft.command.argument.EntityArgumentType;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.LoreComponent;
+          import net.minecraft.component.type.NbtComponent;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.ActionResult;
+
+          import java.util.List;
+
+          import static net.minecraft.server.command.CommandManager.argument;
+          import static net.minecraft.server.command.CommandManager.literal;
+
+          /** /withdraw (to sec tien), /redeem (ve rank), /suicide */
+          public class Notes {
+              /** Lenh console chay khi doi ve rank. Doi cho hop voi plugin phan quyen cua ban. */
+              static final String RANK_COMMAND = "lp user {player} parent set {rank}";
+
+              static NbtCompound data(ItemStack s) {
+                  NbtComponent c = s.get(DataComponentTypes.CUSTOM_DATA);
+                  return c == null ? new NbtCompound() : c.copyNbt();
+              }
+
+              static void init() {
+                  // chuot phai to sec -> nap tien
+                  UseItemCallback.EVENT.register((player, world, hand) -> {
+                      if (world.isClient || !Admin.on("notes") || !(player instanceof ServerPlayerEntity sp)) return ActionResult.PASS;
+                      ItemStack s = player.getStackInHand(hand);
+                      if (s.isEmpty() || s.getItem() != Items.PAPER) return ActionResult.PASS;
+                      NbtCompound n = data(s);
+                      if (!n.contains("dl_note")) return ActionResult.PASS;
+                      double v = n.getDouble("dl_note");
+                      s.decrement(1);
+                      DonutLike.add(sp.getUuid(), v);
+                      DonutLike.msg(sp, "§aĐã nạp tờ séc: +$" + DonutLike.fmt(v));
+                      return ActionResult.SUCCESS;
+                  });
+              }
+
+              static void register(CommandDispatcher<ServerCommandSource> d) {
+                  d.register(literal("withdraw").requires(s -> Admin.on("notes")).then(argument("amount", DoubleArgumentType.doubleArg(1)).executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      double a = Math.floor(DoubleArgumentType.getDouble(c, "amount") * 100) / 100.0;
+                      if (DonutLike.bal(p.getUuid()) < a) { DonutLike.msg(p, "§cBạn không đủ tiền."); return 0; }
+                      DonutLike.add(p.getUuid(), -a);
+                      ItemStack note = new ItemStack(Items.PAPER);
+                      NbtCompound n = new NbtCompound();
+                      n.putDouble("dl_note", a);
+                      n.putLong("dl_id", System.nanoTime()); // moi to sec la duy nhat, khong stack
+                      note.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.of(n));
+                      note.set(DataComponentTypes.CUSTOM_NAME, Text.literal("§aTờ séc §e$" + DonutLike.fmt(a)));
+                      note.set(DataComponentTypes.LORE, new LoreComponent(List.of(
+                          Text.literal("§7Chuột phải để nạp tiền vào tài khoản"),
+                          Text.literal("§7Ký bởi: " + p.getName().getString()))));
+                      p.getInventory().offerOrDrop(note);
+                      DonutLike.msg(p, "§aĐã rút $" + DonutLike.fmt(a) + " thành tờ séc. Mất tờ séc = mất tiền, hãy cẩn thận!");
+                      return 1;
+                  })));
+
+                  // /redeem : doi ve rank dang cam tren tay
+                  d.register(literal("redeem").requires(s -> Admin.on("notes")).executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      ItemStack s = p.getMainHandStack();
+                      NbtCompound n = data(s);
+                      if (s.isEmpty() || !n.contains("dl_rank")) { DonutLike.msg(p, "§cHãy cầm vé rank trên tay."); return 0; }
+                      String rank = n.getString("dl_rank");
+                      s.decrement(1);
+                      var srv = p.getServer();
+                      srv.getCommandManager().executeWithPrefix(srv.getCommandSource(),
+                          RANK_COMMAND.replace("{player}", p.getName().getString()).replace("{rank}", rank));
+                      srv.getPlayerManager().broadcast(Text.literal("§6" + p.getName().getString() + " đã kích hoạt rank §e" + rank + "§6!"), false);
+                      return 1;
+                  }));
+
+                  // /rankvoucher <player> <rank> (op) : tao ve rank (ve co the bi cuop/trao doi)
+                  d.register(literal("rankvoucher").requires(src -> src.hasPermissionLevel(2) && Admin.on("notes"))
+                      .then(argument("player", EntityArgumentType.player())
+                      .then(argument("rank", StringArgumentType.word()).executes(c -> {
+                          ServerPlayerEntity t = EntityArgumentType.getPlayer(c, "player");
+                          String rank = StringArgumentType.getString(c, "rank");
+                          ItemStack v = new ItemStack(Items.NETHER_STAR);
+                          NbtCompound n = new NbtCompound();
+                          n.putString("dl_rank", rank);
+                          n.putLong("dl_id", System.nanoTime());
+                          v.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.of(n));
+                          v.set(DataComponentTypes.CUSTOM_NAME, Text.literal("§6Vé Rank §e" + rank));
+                          v.set(DataComponentTypes.LORE, new LoreComponent(List.of(Text.literal("§7Cầm trên tay và gõ §e/redeem"))));
+                          t.getInventory().offerOrDrop(v);
+                          return 1;
+                      }))));
+
+                  d.register(literal("suicide").requires(s -> Admin.on("suicide")).executes(c -> {
+                      ServerPlayerEntity p = c.getSource().getPlayerOrThrow();
+                      if (Duels.inDuel(p)) { DonutLike.msg(p, "§cKhông thể dùng khi đang duel."); return 0; }
+                      p.kill((ServerWorld) p.getWorld());
+                      return 1;
+                  }));
+              }
+          }
+          EOF_DL
+          mkdir -p "src/main/java/com/donutlike"
+          cat > "src/main/java/com/donutlike/ShopHandler.java" <<'EOF_DL'
+          package com.donutlike;
+
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.LoreComponent;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.inventory.SimpleInventory;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.screen.GenericContainerScreenHandler;
+          import net.minecraft.screen.ScreenHandlerType;
+          import net.minecraft.screen.SimpleNamedScreenHandlerFactory;
+          import net.minecraft.screen.slot.SlotActionType;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Identifier;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class ShopHandler extends GenericContainerScreenHandler {
+              private final List<Item> items = new ArrayList<>();
+
+              public static void open(ServerPlayerEntity p) {
+                  p.openHandledScreen(new SimpleNamedScreenHandlerFactory(
+                      (syncId, inv, player) -> new ShopHandler(syncId, inv, new SimpleInventory(27)),
+                      Text.literal("Shop (click = 1, shift+click = 16)")));
+              }
+
+              public ShopHandler(int syncId, PlayerInventory pinv, SimpleInventory inv) {
+                  super(ScreenHandlerType.GENERIC_9X3, syncId, pinv, inv, 3);
+                  int i = 0;
+                  for (String id : DonutLike.PRICES.keySet()) {
+                      if (i >= 27) break;
+                      Item it = Registries.ITEM.get(Identifier.of("minecraft", id));
+                      items.add(it);
+                      ItemStack d = new ItemStack(it);
+                      d.set(DataComponentTypes.LORE, new LoreComponent(List.of(
+                          Text.literal("§eGiá: $" + DonutLike.fmt(DonutLike.value(it) * 1.5) + "/cái"))));
+                      inv.setStack(i++, d);
+                  }
+              }
+
+              @Override
+              public void onSlotClick(int slot, int button, SlotActionType type, PlayerEntity player) {
+                  if (slot >= 0 && slot < items.size() && player instanceof ServerPlayerEntity sp
+                          && (type == SlotActionType.PICKUP || type == SlotActionType.QUICK_MOVE)) {
+                      Item it = items.get(slot);
+                      int n = Math.min(type == SlotActionType.QUICK_MOVE ? 16 : 1, it.getMaxCount());
+                      double cost = DonutLike.value(it) * 1.5 * n;
+                      if (DonutLike.bal(sp.getUuid()) < cost) {
+                          DonutLike.msg(sp, "§cKhông đủ tiền ($" + DonutLike.fmt(cost) + ").");
+                      } else {
+                          DonutLike.add(sp.getUuid(), -cost);
+                          sp.getInventory().offerOrDrop(new ItemStack(it, n));
+                          DonutLike.msg(sp, "§aĐã mua " + n + "x " + new ItemStack(it).getName().getString() + " - $" + DonutLike.fmt(cost));
+                      }
+                  }
+                  syncState();
+              }
+
+              @Override
+              public ItemStack quickMove(PlayerEntity player, int slot) { return ItemStack.EMPTY; }
+          }
+          EOF_DL
+          mkdir -p "src/main/resources"
+          cat > "src/main/resources/fabric.mod.json" <<'EOF_DL'
+          {
+            "schemaVersion": 1,
+            "id": "donutlike",
+            "version": "${version}",
+            "name": "DonutLike",
+            "description": "Spawn, AH, Sell, Order, NPC, can cu rai rac (nguyen ven/bi raid), sidebar va baltop kieu DonutSMP.",
+            "authors": ["You"],
+            "environment": "*",
+            "entrypoints": { "main": ["com.donutlike.DonutLike"] },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.4",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF_DL
+
+      - name: Build
+        working-directory: ${{ runner.temp }}/proj
+        run: gradle build --no-daemon
+
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: donutlike-mod
+          path: |
+            ${{ runner.temp }}/proj/build/libs/*.jar
+            !${{ runner.temp }}/proj/build/libs/*-sources.jar
+
+      - name: Create GitHub Release (khi push tag vX.Y.Z)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ runner.temp }}/proj/build/libs/*.jar
